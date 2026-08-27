@@ -1,1 +1,0 @@
-"""NJU coding agent package."""
