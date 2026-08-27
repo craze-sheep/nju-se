@@ -1,4 +1,8 @@
+from pathlib import Path
 import sys
+
+from .agent import run_agent
+from .config import load_settings
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -9,7 +13,12 @@ def main(argv: list[str] | None = None) -> int:
         print("用法：python -m nju_agent \"你的编程任务\"")
         return 2
 
-    print(f"用户任务：{task}")
+    try:
+        settings = load_settings()
+        run_agent(task, workspace_root=Path.cwd(), settings=settings)
+    except RuntimeError as exc:
+        print(f"错误：{exc}")
+        return 2
     return 0
 
 

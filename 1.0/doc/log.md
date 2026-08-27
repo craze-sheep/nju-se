@@ -109,3 +109,51 @@ PYTHONPATH=1.0/src pytest 1.0/tests -q
 下一步：
 
 - 阶段 4：实现模型配置和调用封装。
+
+### 阶段 4：模型配置和调用
+
+目标：
+
+- 从环境变量读取模型配置。
+- 通过 OpenAI 客户端调用 Responses API。
+- 把模型的工具请求接回本地工具执行。
+
+修改内容：
+
+- 创建 `1.0/src/nju_agent/config.py`。
+- 创建 `1.0/src/nju_agent/llm.py`。
+- 创建 `1.0/src/nju_agent/agent.py`。
+- 更新 `1.0/src/nju_agent/__main__.py`。
+- 新增 `1.0/tests/test_config.py`。
+- 新增 `1.0/tests/test_llm.py`。
+- 扩展 `1.0/tests/test_agent.py`。
+
+验证命令：
+
+```bash
+PYTHONPATH=1.0/src pytest 1.0/tests -q
+python -m compileall 1.0/src/nju_agent
+```
+
+验证结果：
+
+```text
+10 passed
+```
+
+下一步：
+
+- 整理 README 和提交说明。
+
+### 口径统一
+
+目标：
+
+- 让仓库说明统一描述为“模型客户端 + 本地工具 + 自写 agent 循环”。
+
+已完成：
+
+- 更新 `README.txt`。
+- 更新 `1.0/README.md`。
+- 更新 `1.0/doc/1.0软件开发流程.md`。
+- 更新 `1.0/doc/requirements.md`。
