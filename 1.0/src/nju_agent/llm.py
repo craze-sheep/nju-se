@@ -21,7 +21,6 @@ def request_response(
     input: Any,
     tools: list[dict[str, Any]],
     instructions: str,
-    previous_response_id: str | None = None,
 ) -> Any:
     request_kwargs: dict[str, Any] = {
         "model": model,
@@ -29,7 +28,5 @@ def request_response(
         "tools": tools,
         "instructions": instructions,
     }
-    if previous_response_id is not None:
-        request_kwargs["previous_response_id"] = previous_response_id
 
     return client.responses.create(**request_kwargs)

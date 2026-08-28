@@ -97,6 +97,28 @@ def _format_tool_result(name: str, result: Any) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+def _response_item_to_history(item: Any) -> dict[str, Any] | None:
+    item_type = getattr(item, "type", None)
+
+    if item_type == "message":
+        text = "".join(
+            getattr(part, "text", "")
+            for part in getattr(item, "content", [])
+            if getattr(part, "type", None) == "output_text"
+        )
+        return {"role": "assistant", "content": text}
+
+    if item_type == "function_call":
+        return {
+            "type": "function_call",
+            "call_id": getattr(item, "call_id", ""),
+            "name": getattr(item, "name", ""),
+            "arguments": getattr(item, "arguments", "{}"),
+        }
+
+    return None
+
+
 def _call_tool(name: str, arguments: dict[str, Any], workspace_root: Path) -> str:
     root = str(workspace_root)
 
@@ -127,8 +149,8 @@ def _call_tool(name: str, arguments: dict[str, Any], workspace_root: Path) -> st
         return f"错误：{exc}"
 
 
-def run_agent(
-    task: str,
+def _run_conversation(
+    conversation: list[dict[str, Any]],
     *,
     workspace_root: Path,
     client: Any | None = None,
@@ -140,20 +162,15 @@ def run_agent(
     workspace_root = workspace_root.resolve()
     emit = logger or (lambda _: None)
 
-    emit(f"用户任务：{task}")
-
     response = None
-    previous_response_id: str | None = None
-    model_input: Any = task
 
     for _ in range(settings.max_steps):
         response = request_response(
             client,
             model=settings.model,
-            input=model_input,
+            input=conversation,
             tools=tool_definitions(),
             instructions=SYSTEM_PROMPT,
-            previous_response_id=previous_response_id,
         )
 
         tool_calls = [
@@ -161,20 +178,37 @@ def run_agent(
             for item in getattr(response, "output", [])
             if getattr(item, "type", None) == "function_call"
         ]
+
+        for item in getattr(response, "output", []):
+            history_item = _response_item_to_history(item)
+            if history_item is not None:
+                conversation.append(history_item)
+
         if not tool_calls:
             final_text = getattr(response, "output_text", "") or ""
             emit(f"最终结果：{final_text}")
             return final_text
 
-        model_input = []
-        previous_response_id = getattr(response, "id", None)
-
         for item in tool_calls:
-            arguments = json.loads(getattr(item, "arguments", "{}"))
+            try:
+                arguments = json.loads(getattr(item, "arguments", "{}"))
+            except json.JSONDecodeError as exc:
+                result = f"错误：工具参数不是有效 JSON：{exc}"
+                emit(f"工具调用：{item.name}")
+                emit(f"工具结果：{result}")
+                conversation.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": item.call_id,
+                        "output": result,
+                    }
+                )
+                continue
+
             emit(f"工具调用：{item.name}")
             result = _call_tool(item.name, arguments, workspace_root)
             emit(f"工具结果：{result}")
-            model_input.append(
+            conversation.append(
                 {
                     "type": "function_call_output",
                     "call_id": item.call_id,
@@ -183,3 +217,69 @@ def run_agent(
             )
 
     raise RuntimeError("Exceeded max agent steps")
+
+
+def run_agent(
+    task: str,
+    *,
+    workspace_root: Path,
+    client: Any | None = None,
+    settings: Settings | None = None,
+    logger: Callable[[str], None] | None = print,
+) -> str:
+    emit = logger or (lambda _: None)
+    emit(f"用户任务：{task}")
+    conversation: list[dict[str, Any]] = [{"role": "user", "content": task}]
+    return _run_conversation(
+        conversation,
+        workspace_root=workspace_root,
+        client=client,
+        settings=settings,
+        logger=logger,
+    )
+
+
+def run_chat_session(
+    *,
+    workspace_root: Path,
+    client: Any | None = None,
+    settings: Settings | None = None,
+    logger: Callable[[str], None] | None = print,
+    input_fn: Callable[[str], str] = input,
+) -> None:
+    settings = settings or load_settings()
+    client = client or build_client(settings)
+    workspace_root = workspace_root.resolve()
+    emit = logger or (lambda _: None)
+    conversation: list[dict[str, Any]] = []
+
+    emit("进入对话模式，输入 /exit 退出")
+
+    while True:
+        try:
+            user_text = input_fn("你> ").strip()
+        except EOFError:
+            emit("")
+            break
+        except KeyboardInterrupt:
+            emit("")
+            break
+
+        if not user_text:
+            continue
+        if user_text in {"/exit", "exit", "quit", "/quit"}:
+            break
+
+        emit(f"用户任务：{user_text}")
+        conversation.append({"role": "user", "content": user_text})
+
+        try:
+            _run_conversation(
+                conversation,
+                workspace_root=workspace_root,
+                client=client,
+                settings=settings,
+                logger=logger,
+            )
+        except RuntimeError as exc:
+            emit(f"错误：{exc}")

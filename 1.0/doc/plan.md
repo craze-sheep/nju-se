@@ -77,7 +77,7 @@ git push
 
 ```bash
 PYTHONPATH=1.0/src pytest 1.0/tests/test_agent.py -q
-PYTHONPATH=1.0/src python -m nju_agent "hello"
+PYTHONPATH=1.0/src python -m nju_agent
 ```
 
 建议提交：
@@ -134,9 +134,9 @@ git push
 
 测试目标：
 
-- 能从环境变量读取 `OPENAI_API_KEY`。
-- 能读取可选的 `OPENAI_BASE_URL`。
-- 能读取可选的 `OPENAI_MODEL`。
+- 能从环境变量读取 `DEEPSEEK_API_KEY`。
+- 能读取可选的 `DEEPSEEK_BASE_URL`。
+- 能读取可选的 `DEEPSEEK_MODEL`。
 - 没有 API key 时给出清楚错误。
 
 再实现：
@@ -202,7 +202,7 @@ git push
 运行方式：
 
 ```bash
-PYTHONPATH=1.0/src python -m nju_agent "创建 hello.py 并运行"
+PYTHONPATH=1.0/src python -m nju_agent
 ```
 
 输出内容：
@@ -215,7 +215,7 @@ PYTHONPATH=1.0/src python -m nju_agent "创建 hello.py 并运行"
 验证：
 
 ```bash
-PYTHONPATH=1.0/src python -m nju_agent "创建一个 hello.py，让它打印 hello nju，然后运行它"
+PYTHONPATH=1.0/src python -m nju_agent
 ```
 
 建议提交：

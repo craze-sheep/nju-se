@@ -18,7 +18,7 @@ class FakeClient:
         self.responses = FakeResponses()
 
 
-def test_request_response_passes_previous_response_id() -> None:
+def test_request_response_passes_request_arguments() -> None:
     client = FakeClient()
 
     response = request_response(
@@ -27,9 +27,8 @@ def test_request_response_passes_previous_response_id() -> None:
         input="hello",
         tools=[{"type": "function", "name": "demo"}],
         instructions="be helpful",
-        previous_response_id="prev-1",
     )
 
     assert response.id == "resp-1"
-    assert client.responses.calls[0]["previous_response_id"] == "prev-1"
     assert client.responses.calls[0]["model"] == "gpt-test"
+    assert client.responses.calls[0]["input"] == "hello"

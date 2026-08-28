@@ -28,7 +28,7 @@
 目标：
 
 - 让 `nju_agent` 可以被 Python 导入。
-- 让 `python -m nju_agent "hello"` 可以从命令行启动。
+- 让 `python -m nju_agent` 可以从命令行启动并进入对话模式。
 
 先失败的测试：
 
@@ -52,14 +52,14 @@ ModuleNotFoundError: No module named 'nju_agent'
 
 ```bash
 PYTHONPATH=1.0/src pytest 1.0/tests/test_agent.py -q
-PYTHONPATH=1.0/src python -m nju_agent "hello"
+PYTHONPATH=1.0/src python -m nju_agent
 ```
 
 验证结果：
 
 ```text
 2 passed
-用户任务：hello
+进入对话模式，输入 /exit 退出
 ```
 
 下一步：
@@ -115,7 +115,7 @@ PYTHONPATH=1.0/src pytest 1.0/tests -q
 目标：
 
 - 从环境变量读取模型配置。
-- 通过 OpenAI 客户端调用 Responses API。
+- 通过 DeepSeek 兼容客户端调用 Responses API。
 - 把模型的工具请求接回本地工具执行。
 
 修改内容：
@@ -157,3 +157,17 @@ python -m compileall 1.0/src/nju_agent
 - 更新 `1.0/README.md`。
 - 更新 `1.0/doc/1.0软件开发流程.md`。
 - 更新 `1.0/doc/requirements.md`。
+
+### DeepSeek 切换
+
+目标：
+
+- 将默认模型接入切换为 DeepSeek。
+- 让 agent 在本地保存完整上下文，适配 DeepSeek Responses API 的无状态调用方式。
+
+已完成：
+
+- 更新 `1.0/src/nju_agent/config.py`。
+- 更新 `1.0/src/nju_agent/llm.py`。
+- 更新 `1.0/src/nju_agent/agent.py`。
+- 更新测试文件。
