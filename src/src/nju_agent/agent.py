@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from .config import Settings, load_settings
 from .llm import build_client, request_response
@@ -95,6 +98,220 @@ def _format_tool_result(name: str, result: Any) -> str:
     if isinstance(result, str):
         return result
     return json.dumps(result, ensure_ascii=False)
+
+
+def _conversation_file(workspace_root: Path) -> Path:
+    return workspace_root / ".nju_agent" / "conversation.json"
+
+
+def _sessions_dir(workspace_root: Path) -> Path:
+    return workspace_root / ".nju_agent" / "sessions"
+
+
+def _sessions_index_file(workspace_root: Path) -> Path:
+    return workspace_root / ".nju_agent" / "sessions.json"
+
+
+def _load_conversation(path: Path) -> list[dict[str, Any]]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    conversation: list[dict[str, Any]] = []
+    for item in data:
+        if isinstance(item, dict):
+            conversation.append(item)
+    return conversation
+
+
+def _save_conversation(path: Path, conversation: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(conversation, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _clear_conversation(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _load_sessions_index(path: Path) -> list[dict[str, Any]]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    sessions: list[dict[str, Any]] = []
+    for item in data:
+        if isinstance(item, dict):
+            sessions.append(item)
+    return sessions
+
+
+def _save_sessions_index(path: Path, sessions: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(sessions, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _session_path(workspace_root: Path, session_id: str) -> Path:
+    return _sessions_dir(workspace_root) / f"{session_id}.json"
+
+
+def _session_label(session: dict[str, Any]) -> str:
+    title = str(session.get("title", "")).strip()
+    if title:
+        return title
+    session_id = str(session.get("id", "")).strip()
+    if session_id:
+        return session_id
+    return "未命名会话"
+
+
+def _print_conversation_history(
+    conversation: list[dict[str, Any]],
+    logger: Callable[[str], None],
+) -> None:
+    emit = logger or (lambda _: None)
+    if not conversation:
+        return
+
+    emit("历史消息：")
+    for item in conversation:
+        role = str(item.get("role", "")).strip()
+        content = str(item.get("content", "")).strip()
+        if not content:
+            continue
+        if role == "user":
+            emit(f"你：{content}")
+        elif role == "assistant":
+            emit(f"助手：{content}")
+
+
+def _derive_session_title(text: str) -> str:
+    text = " ".join(text.split()).strip()
+    if not text:
+        return "新会话"
+    return text[:24]
+
+
+def _create_session_record(title: str = "新会话") -> dict[str, Any]:
+    now = time.time()
+    timestamp = datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S")
+    return {
+        "id": uuid4().hex,
+        "title": f"{title} {timestamp}" if title == "新会话" else title,
+        "created_at": now,
+        "updated_at": now,
+        "message_count": 0,
+    }
+
+
+def _choose_session(
+    sessions: list[dict[str, Any]],
+    input_fn: Callable[[str], str],
+    logger: Callable[[str], None],
+) -> dict[str, Any] | None:
+    emit = logger or (lambda _: None)
+    if not sessions:
+        return _create_session_record()
+
+    emit("可用会话：")
+    for index, session in enumerate(sessions, start=1):
+        emit(f"{index}. {_session_label(session)}")
+    emit("n. 新建会话")
+    emit("b. 返回")
+
+    while True:
+        choice = input_fn("选择会话编号，或输入 n 新建，b 返回：").strip().lower()
+        if choice in {"b", "back"}:
+            return None
+        if choice in {"n", "new"}:
+            return _create_session_record()
+        if choice.isdigit():
+            index = int(choice) - 1
+            if 0 <= index < len(sessions):
+                return sessions[index]
+        emit("输入无效，请重新选择")
+
+
+def _sync_session_state(
+    *,
+    sessions_index_path: Path,
+    sessions: list[dict[str, Any]],
+    active_session: dict[str, Any],
+    active_session_path: Path,
+    conversation: list[dict[str, Any]],
+    keep_empty: bool = True,
+) -> list[dict[str, Any]]:
+    if conversation:
+        _save_conversation(active_session_path, conversation)
+    elif keep_empty:
+        _clear_conversation(active_session_path)
+    else:
+        sessions = [
+            session
+            for session in sessions
+            if session.get("id") != active_session.get("id")
+        ]
+        _save_sessions_index(sessions_index_path, sessions)
+        return sessions
+
+    active_session["updated_at"] = time.time()
+    active_session["message_count"] = len(conversation)
+    sessions = _update_session_index(sessions, active_session)
+    _save_sessions_index(sessions_index_path, sessions)
+    return sessions
+
+
+def _update_session_index(
+    sessions: list[dict[str, Any]],
+    active_session: dict[str, Any],
+) -> list[dict[str, Any]]:
+    next_sessions: list[dict[str, Any]] = []
+    found = False
+    for session in sessions:
+        if session.get("id") == active_session.get("id"):
+            next_sessions.append(active_session)
+            found = True
+        else:
+            next_sessions.append(session)
+    if not found:
+        next_sessions.append(active_session)
+    return sorted(
+        next_sessions,
+        key=lambda item: float(item.get("updated_at", 0.0)),
+        reverse=True,
+    )
+
+
+def _should_title_from_first_message(session: dict[str, Any]) -> bool:
+    title = str(session.get("title", "")).strip()
+    message_count = int(session.get("message_count", 0) or 0)
+    return message_count == 0 and title.startswith("新会话")
 
 
 def _response_item_to_history(item: Any) -> dict[str, Any] | None:
@@ -245,24 +462,105 @@ def run_chat_session(
     client = client or build_client(settings)
     workspace_root = workspace_root.resolve()
     emit = logger or (lambda _: None)
-    conversation: list[dict[str, Any]] = []
+    sessions_index_path = _sessions_index_file(workspace_root)
+    sessions = _load_sessions_index(sessions_index_path)
+    legacy_conversation_path = _conversation_file(workspace_root)
 
-    emit("进入对话模式，输入 /exit 退出")
+    if not sessions and legacy_conversation_path.exists():
+        conversation = _load_conversation(legacy_conversation_path)
+        if conversation:
+            active_session = _create_session_record("迁移会话")
+            active_session["message_count"] = len(conversation)
+            _save_conversation(_session_path(workspace_root, active_session["id"]), conversation)
+            sessions = [active_session]
+            _save_sessions_index(sessions_index_path, sessions)
+            _clear_conversation(legacy_conversation_path)
+
+    emit("进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话")
+
+    active_session = _create_session_record()
+    active_session_path = _session_path(workspace_root, str(active_session["id"]))
+    conversation: list[dict[str, Any]] = []
+    active_session_persisted = False
 
     while True:
         try:
             user_text = input_fn("你> ").strip()
         except EOFError:
-            emit("")
             break
         except KeyboardInterrupt:
-            emit("")
             break
 
         if not user_text:
             continue
         if user_text in {"/exit", "exit", "quit", "/quit"}:
+            if active_session_persisted or conversation:
+                sessions = _sync_session_state(
+                    sessions_index_path=sessions_index_path,
+                    sessions=sessions,
+                    active_session=active_session,
+                    active_session_path=active_session_path,
+                    conversation=conversation,
+                    keep_empty=active_session_persisted,
+                )
             break
+        if user_text in {"/reset", "reset"}:
+            conversation.clear()
+            if active_session_persisted:
+                sessions = _sync_session_state(
+                    sessions_index_path=sessions_index_path,
+                    sessions=sessions,
+                    active_session=active_session,
+                    active_session_path=active_session_path,
+                    conversation=conversation,
+                )
+            continue
+        if user_text in {"/new", "new"}:
+            if active_session_persisted or conversation:
+                sessions = _sync_session_state(
+                    sessions_index_path=sessions_index_path,
+                    sessions=sessions,
+                    active_session=active_session,
+                    active_session_path=active_session_path,
+                    conversation=conversation,
+                    keep_empty=active_session_persisted,
+                )
+            active_session = _create_session_record()
+            active_session_path = _session_path(workspace_root, str(active_session["id"]))
+            conversation = []
+            active_session_persisted = False
+            continue
+        if user_text in {"/choose", "choose", "/switch", "switch"}:
+            if active_session_persisted or conversation:
+                sessions = _sync_session_state(
+                    sessions_index_path=sessions_index_path,
+                    sessions=sessions,
+                    active_session=active_session,
+                    active_session_path=active_session_path,
+                    conversation=conversation,
+                    keep_empty=active_session_persisted,
+                )
+            selected_session = _choose_session(sessions, input_fn, emit)
+            if selected_session is None:
+                continue
+            existing_session = any(
+                session.get("id") == selected_session.get("id")
+                for session in sessions
+            )
+            active_session = selected_session
+            active_session_path = _session_path(workspace_root, str(active_session["id"]))
+            conversation = _load_conversation(active_session_path) if existing_session else []
+            active_session_persisted = existing_session
+            if existing_session:
+                active_session["message_count"] = len(conversation)
+                _print_conversation_history(conversation, emit)
+            continue
+
+        if _should_title_from_first_message(active_session):
+            active_session["title"] = _derive_session_title(user_text)
+            active_session["updated_at"] = time.time()
+            sessions = _update_session_index(sessions, active_session)
+            _save_sessions_index(sessions_index_path, sessions)
 
         conversation.append({"role": "user", "content": user_text})
 
@@ -275,4 +573,13 @@ def run_chat_session(
                 logger=logger,
             )
         except RuntimeError as exc:
-            emit(f"错误：{exc}")
+            emit(f"最终结果：错误：{exc}")
+
+        sessions = _sync_session_state(
+            sessions_index_path=sessions_index_path,
+            sessions=sessions,
+            active_session=active_session,
+            active_session_path=active_session_path,
+            conversation=conversation,
+        )
+        active_session_persisted = True
