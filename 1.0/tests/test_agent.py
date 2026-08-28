@@ -51,7 +51,6 @@ def test_run_agent_handles_tool_call_then_completion(tmp_path: Path) -> None:
 
     assert result == "done"
     assert (tmp_path / "hello.txt").read_text(encoding="utf-8") == "hi"
-    assert any(line.startswith("工具调用：write_file") for line in logs)
     assert calls[0]["input"][0]["role"] == "user"
     assert calls[1]["input"][-1]["type"] == "function_call_output"
 

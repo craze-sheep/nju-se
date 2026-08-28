@@ -194,8 +194,6 @@ def _run_conversation(
                 arguments = json.loads(getattr(item, "arguments", "{}"))
             except json.JSONDecodeError as exc:
                 result = f"错误：工具参数不是有效 JSON：{exc}"
-                emit(f"工具调用：{item.name}")
-                emit(f"工具结果：{result}")
                 conversation.append(
                     {
                         "type": "function_call_output",
@@ -205,9 +203,7 @@ def _run_conversation(
                 )
                 continue
 
-            emit(f"工具调用：{item.name}")
             result = _call_tool(item.name, arguments, workspace_root)
-            emit(f"工具结果：{result}")
             conversation.append(
                 {
                     "type": "function_call_output",
@@ -227,8 +223,6 @@ def run_agent(
     settings: Settings | None = None,
     logger: Callable[[str], None] | None = print,
 ) -> str:
-    emit = logger or (lambda _: None)
-    emit(f"用户任务：{task}")
     conversation: list[dict[str, Any]] = [{"role": "user", "content": task}]
     return _run_conversation(
         conversation,
@@ -270,7 +264,6 @@ def run_chat_session(
         if user_text in {"/exit", "exit", "quit", "/quit"}:
             break
 
-        emit(f"用户任务：{user_text}")
         conversation.append({"role": "user", "content": user_text})
 
         try:
