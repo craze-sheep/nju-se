@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -79,6 +80,12 @@ class SequencedResponses:
         self.calls.append(kwargs)
         index = min(len(self.calls) - 1, len(self.responses) - 1)
         return self.responses[index]
+
+
+def _init_git_repo(tmp_path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True, capture_output=True, text=True)
 
 
 def test_compact_session_memory_if_needed_updates_memory(tmp_path: Path) -> None:
@@ -234,7 +241,7 @@ def test_run_chat_session_keeps_conversation_history(tmp_path: Path) -> None:
     assert responses.calls[0]["input"][0]["content"] == "first task"
     assert any(item.get("content") == "second task" for item in responses.calls[1]["input"])
     assert any(item.get("content") == "done-1" for item in responses.calls[1]["input"])
-    assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话"
+    assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/diff 查看差异，/undo 撤销写入"
     assert logs[1:] == ["最终结果：done-1", "最终结果：done-2"]
     sessions = json.loads((tmp_path / ".nju_agent" / "sessions.json").read_text(encoding="utf-8"))
     assert len(sessions) == 1
@@ -243,6 +250,55 @@ def test_run_chat_session_keeps_conversation_history(tmp_path: Path) -> None:
     assert (tmp_path / ".nju_agent" / "memory" / f"{sessions[0]['id']}.json").exists()
     assert (tmp_path / ".nju_agent" / "global_memory.md").exists()
     assert len(responses.calls) == 4
+
+
+def test_run_chat_session_undo_reverts_last_write_batch(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    responses = SequencedResponses(
+        [
+            SimpleNamespace(
+                id="resp-1",
+                output=[
+                    SimpleNamespace(
+                        type="function_call",
+                        name="write_file",
+                        arguments=json.dumps(
+                            {"relative_path": "hello.txt", "content": "new content"}
+                        ),
+                        call_id="call-1",
+                    )
+                ],
+                output_text="",
+            ),
+            _empty_response("done"),
+            _summary_response(),
+            _global_memory_response(),
+        ]
+    )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = responses
+
+    (tmp_path / "hello.txt").write_text("old content", encoding="utf-8")
+    subprocess.run(["git", "add", "hello.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    inputs = iter(["make change", "/undo", "/exit"])
+
+    run_chat_session(
+        workspace_root=tmp_path,
+        client=FakeClient(),
+        settings=Settings(api_key="key", model="deepseek-test", max_steps=3),
+        logger=lambda _: None,
+        input_fn=lambda _: next(inputs),
+    )
+
+    assert (tmp_path / "hello.txt").read_text(encoding="utf-8") == "old content"
+    sessions = json.loads((tmp_path / ".nju_agent" / "sessions.json").read_text(encoding="utf-8"))
+    session_id = sessions[0]["id"]
+    batches_path = tmp_path / ".nju_agent" / "write_batches" / f"{session_id}.json"
+    assert batches_path.exists()
+    assert json.loads(batches_path.read_text(encoding="utf-8")) == []
 
 
 def test_run_chat_session_starts_new_session_by_default(tmp_path: Path) -> None:
@@ -288,7 +344,7 @@ def test_run_chat_session_starts_new_session_by_default(tmp_path: Path) -> None:
 
     assert all(item.get("content") != "old" for item in responses.calls[0]["input"])
     assert any(item.get("content") == "new task" for item in responses.calls[0]["input"])
-    assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话"
+    assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/diff 查看差异，/undo 撤销写入"
     assert logs[1] == "最终结果：done"
 
 
@@ -339,7 +395,7 @@ def test_run_chat_session_choose_loads_saved_history(tmp_path: Path) -> None:
     assert any(line == "1. 旧会话" for line in logs)
     assert any(line == "历史消息：" for line in logs)
     assert any(line == "你：old" for line in logs)
-    assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话"
+    assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/diff 查看差异，/undo 撤销写入"
     assert logs[-1] == "最终结果：done"
 
 

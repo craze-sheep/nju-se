@@ -12,7 +12,7 @@ import tiktoken
 
 from .config import Settings, load_settings
 from .llm import build_client, request_response
-from .tools import list_files, read_file, run_command, write_file
+from .tools import list_files, read_file, run_command, revert_write_file, write_file
 
 
 SYSTEM_PROMPT = """You are a coding agent.
@@ -194,6 +194,14 @@ def _global_memory_file(workspace_root: Path) -> Path:
     return workspace_root / ".nju_agent" / "global_memory.md"
 
 
+def _write_batches_dir(workspace_root: Path) -> Path:
+    return workspace_root / ".nju_agent" / "write_batches"
+
+
+def _write_batches_file(workspace_root: Path, session_id: str) -> Path:
+    return _write_batches_dir(workspace_root) / f"{session_id}.json"
+
+
 def _load_conversation(path: Path) -> list[dict[str, Any]]:
     try:
         raw = path.read_text(encoding="utf-8")
@@ -256,6 +264,103 @@ def _load_json_file(path: Path, default: Any) -> Any:
 def _save_json_file(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_write_batches(workspace_root: Path, session_id: str) -> list[dict[str, Any]]:
+    data = _load_json_file(_write_batches_file(workspace_root, session_id), [])
+    return data if isinstance(data, list) else []
+
+
+def _save_write_batches(
+    workspace_root: Path,
+    session_id: str,
+    batches: list[dict[str, Any]],
+) -> None:
+    _save_json_file(_write_batches_file(workspace_root, session_id), batches)
+
+
+def _record_write_batch(
+    workspace_root: Path,
+    session_id: str,
+    changes: list[dict[str, Any]],
+) -> None:
+    if not changes:
+        return
+    batches = _load_write_batches(workspace_root, session_id)
+    batches.append(
+        {
+            "id": uuid4().hex,
+            "created_at": time.time(),
+            "changes": changes,
+        }
+    )
+    _save_write_batches(workspace_root, session_id, batches)
+
+
+def _format_write_batch_diff(batch: dict[str, Any]) -> str:
+    changes = batch.get("changes", [])
+    if not isinstance(changes, list) or not changes:
+        return "最近一批 write_file 没有记录到文件差异"
+
+    parts: list[str] = []
+    for change in changes:
+        if not isinstance(change, dict):
+            continue
+        diff = str(change.get("diff", "")).strip()
+        relative_path = str(change.get("relative_path", "")).strip()
+        if diff:
+            parts.append(diff)
+        elif relative_path:
+            parts.append(f"{relative_path} 没有文本差异")
+    return "\n\n".join(parts) if parts else "最近一批 write_file 没有记录到文件差异"
+
+
+def _last_write_diff(workspace_root: Path, session_id: str) -> str:
+    batches = _load_write_batches(workspace_root, session_id)
+    if not batches:
+        return "没有可查看的 write_file 差异"
+    return _format_write_batch_diff(batches[-1])
+
+
+def _can_git_undo_change(change: dict[str, Any]) -> bool:
+    if not isinstance(change, dict):
+        return False
+    relative_path = str(change.get("relative_path", "")).strip()
+    if not relative_path:
+        return False
+    tracked_before = bool(change.get("tracked_before", False))
+    existed_before = bool(change.get("existed_before", False))
+    return tracked_before or not existed_before
+
+
+def _undo_last_write_batch(workspace_root: Path, session_id: str) -> str:
+    batches = _load_write_batches(workspace_root, session_id)
+    if not batches:
+        return "没有可撤销的 write_file 操作"
+
+    batch = batches[-1]
+    changes = batch.get("changes", [])
+    if not isinstance(changes, list) or not changes:
+        return "最近一批 write_file 没有可撤销的文件"
+
+    unsupported = [
+        str(change.get("relative_path", "")).strip()
+        for change in changes
+        if isinstance(change, dict) and not _can_git_undo_change(change)
+    ]
+    if unsupported:
+        return f"最近一批 write_file 里有 Git 无法直接撤销的文件：{', '.join(filter(None, unsupported))}"
+
+    try:
+        for change in reversed(changes):
+            if isinstance(change, dict):
+                revert_write_file(str(workspace_root), change)
+    except RuntimeError as exc:
+        return f"撤销失败：{exc}"
+
+    batches.pop()
+    _save_write_batches(workspace_root, session_id, batches)
+    return f"已撤销最近一批 write_file 操作，共 {len(changes)} 个文件"
 
 
 def _default_session_memory() -> dict[str, Any]:
@@ -793,7 +898,12 @@ def _response_item_to_history(item: Any) -> dict[str, Any] | None:
     return None
 
 
-def _call_tool(name: str, arguments: dict[str, Any], workspace_root: Path) -> str:
+def _call_tool(
+    name: str,
+    arguments: dict[str, Any],
+    workspace_root: Path,
+    write_changes: list[dict[str, Any]] | None = None,
+) -> str:
     root = str(workspace_root)
 
     try:
@@ -802,8 +912,23 @@ def _call_tool(name: str, arguments: dict[str, Any], workspace_root: Path) -> st
         if name == "read_file":
             return read_file(root, arguments["relative_path"])
         if name == "write_file":
-            write_file(root, arguments["relative_path"], arguments["content"])
-            return "success"
+            result = write_file(root, arguments["relative_path"], arguments["content"])
+            change = {
+                "relative_path": result.relative_path,
+                "existed_before": result.existed_before,
+                "tracked_before": result.tracked_before,
+                "diff": result.diff,
+            }
+            if write_changes is not None:
+                write_changes.append(change)
+            return _format_tool_result(
+                name,
+                {
+                    "status": "success",
+                    "relative_path": result.relative_path,
+                    "diff": result.diff,
+                },
+            )
         if name == "run_command":
             result = run_command(
                 root,
@@ -830,6 +955,7 @@ def _run_conversation(
     client: Any | None = None,
     settings: Settings | None = None,
     session_memory: dict[str, Any] | None = None,
+    write_changes: list[dict[str, Any]] | None = None,
     logger: Callable[[str], None] | None = print,
 ) -> str:
     settings = settings or load_settings()
@@ -888,7 +1014,12 @@ def _run_conversation(
                 )
                 continue
 
-            result = _call_tool(item.name, arguments, workspace_root)
+            result = _call_tool(
+                item.name,
+                arguments,
+                workspace_root,
+                write_changes=write_changes,
+            )
             conversation.append(
                 {
                     "type": "function_call_output",
@@ -971,7 +1102,7 @@ def run_chat_session(
             _save_sessions_index(sessions_index_path, sessions)
             _clear_conversation(legacy_conversation_path)
 
-    emit("进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话")
+    emit("进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/diff 查看差异，/undo 撤销写入")
 
     active_session = _create_session_record()
     active_session_path = _session_path(workspace_root, str(active_session["id"]))
@@ -1032,6 +1163,12 @@ def run_chat_session(
         if user_text in {"/exit", "exit", "quit", "/quit"}:
             finalize_current_session()
             break
+        if user_text in {"/diff", "diff"}:
+            emit(_last_write_diff(workspace_root, str(active_session["id"])))
+            continue
+        if user_text in {"/undo", "undo"}:
+            emit(_undo_last_write_batch(workspace_root, str(active_session["id"])))
+            continue
         if user_text in {"/reset", "reset"}:
             finalize_current_session()
             conversation.clear()
@@ -1043,6 +1180,7 @@ def run_chat_session(
                 conversation=conversation,
                 keep_empty=True,
             )
+            _save_write_batches(workspace_root, str(active_session["id"]), [])
             session_memory = _default_session_memory()
             active_session_persisted = False
             continue
@@ -1084,6 +1222,7 @@ def run_chat_session(
             _save_sessions_index(sessions_index_path, sessions)
 
         conversation.append({"role": "user", "content": user_text})
+        write_changes: list[dict[str, Any]] = []
 
         try:
             _run_conversation(
@@ -1092,10 +1231,17 @@ def run_chat_session(
                 client=client,
                 settings=settings,
                 session_memory=session_memory,
+                write_changes=write_changes,
                 logger=logger,
             )
         except RuntimeError as exc:
             emit(f"最终结果：错误：{exc}")
+
+        _record_write_batch(
+            workspace_root,
+            str(active_session["id"]),
+            write_changes,
+        )
 
         sessions = _sync_session_state(
             sessions_index_path=sessions_index_path,
