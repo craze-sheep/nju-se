@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
+
+import tiktoken
 
 from .config import Settings, load_settings
 from .llm import build_client, request_response
@@ -16,6 +19,73 @@ SYSTEM_PROMPT = """You are a coding agent.
 Use the available tools to complete the user's task.
 Keep file operations inside the workspace root.
 When you finish, answer briefly in Chinese."""
+
+SESSION_SUMMARY_PROMPT = """你是一个会话摘要器。请根据下面的完整对话，提炼出简短、结构化、可用于后续记忆更新的摘要。
+
+要求：
+1. 只保留对后续有用的信息，不要复述原文。
+2. 优先提炼：任务目标、已确认决定、重要文件、未完成事项、用户偏好。
+3. 如果没有明确内容，就留空，不要编造。
+4. 输出尽量简洁，适合给后续记忆合并模型使用。
+
+输出格式：
+```json
+{
+  "goal": "",
+  "decisions": [],
+  "important_files": [],
+  "open_tasks": [],
+  "user_preferences": [],
+  "notes": []
+}
+```"""
+
+SESSION_MEMORY_UPDATE_PROMPT = """你是一个会话记忆更新器。请把“当前会话记忆”和“新增历史片段”合并成一份更新后的会话记忆。
+
+要求：
+1. 只保留对后续有用的信息，不要复述原文。
+2. 优先保留：任务目标、已确认决定、重要文件、未完成事项、用户偏好。
+3. 如果有冲突，优先保留更稳定、更明确、更长期有效的内容。
+4. 不要保留流水账，不要保留原始对话。
+5. 输出必须是严格 JSON，字段结构保持不变。
+
+输出格式：
+```json
+{
+  "goal": "",
+  "decisions": [],
+  "important_files": [],
+  "open_tasks": [],
+  "user_preferences": [],
+  "notes": []
+}
+```"""
+
+GLOBAL_MEMORY_MERGE_PROMPT = """你是一个全局记忆合并器。请把“现有全局 `.md`”和“本会话摘要”合并成一份新的全局 `.md`。
+
+要求：
+1. 只保留长期稳定、可复用、低歧义的信息。
+2. 去重、合并同义项、删除过时或冲突内容。
+3. 如果新信息和旧 memory 冲突，优先保留更稳定、更明确、更长期有效的内容。
+4. 不要保留流水账，不要保留原始对话。
+5. 输出要短、清晰、适合下次对话直接注入。
+
+输出格式：
+```markdown
+# Global Memory
+
+## User Preferences
+- ...
+
+## Project Rules
+- ...
+
+## Stable Decisions
+- ...
+
+## Common Pitfalls
+- ...
+```"""
 
 
 def tool_definitions() -> list[dict[str, Any]]:
@@ -112,6 +182,18 @@ def _sessions_index_file(workspace_root: Path) -> Path:
     return workspace_root / ".nju_agent" / "sessions.json"
 
 
+def _memory_dir(workspace_root: Path) -> Path:
+    return workspace_root / ".nju_agent" / "memory"
+
+
+def _session_memory_file(workspace_root: Path, session_id: str) -> Path:
+    return _memory_dir(workspace_root) / f"{session_id}.json"
+
+
+def _global_memory_file(workspace_root: Path) -> Path:
+    return workspace_root / ".nju_agent" / "global_memory.md"
+
+
 def _load_conversation(path: Path) -> list[dict[str, Any]]:
     try:
         raw = path.read_text(encoding="utf-8")
@@ -146,6 +228,380 @@ def _clear_conversation(path: Path) -> None:
         path.unlink()
     except FileNotFoundError:
         pass
+
+
+def _load_text_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+def _save_text_file(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def _load_json_file(path: Path, default: Any) -> Any:
+    raw = _load_text_file(path)
+    if not raw:
+        return default
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return default
+    return data if data is not None else default
+
+
+def _save_json_file(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _default_session_memory() -> dict[str, Any]:
+    return {
+        "goal": "",
+        "decisions": [],
+        "important_files": [],
+        "open_tasks": [],
+        "user_preferences": [],
+        "notes": [],
+    }
+
+
+def _normalize_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        text = str(item).strip()
+        if text:
+            result.append(text)
+    return result
+
+
+def _normalize_session_memory(data: Any) -> dict[str, Any]:
+    base = _default_session_memory()
+    if not isinstance(data, dict):
+        return base
+    base["goal"] = str(data.get("goal", "")).strip()
+    base["decisions"] = _normalize_string_list(data.get("decisions", []))
+    base["important_files"] = _normalize_string_list(data.get("important_files", []))
+    base["open_tasks"] = _normalize_string_list(data.get("open_tasks", []))
+    base["user_preferences"] = _normalize_string_list(data.get("user_preferences", []))
+    base["notes"] = _normalize_string_list(data.get("notes", []))
+    return base
+
+
+def _session_memory_markdown(memory: dict[str, Any]) -> str:
+    lines = ["# Session Memory", ""]
+    goal = str(memory.get("goal", "")).strip()
+    lines.extend(["## Goal", f"- {goal or '（空）'}", ""])
+    for key, title in [
+        ("decisions", "Decisions"),
+        ("important_files", "Important Files"),
+        ("open_tasks", "Open Tasks"),
+        ("user_preferences", "User Preferences"),
+        ("notes", "Notes"),
+    ]:
+        lines.append(f"## {title}")
+        items = _normalize_string_list(memory.get(key, []))
+        if items:
+            lines.extend([f"- {item}" for item in items])
+        else:
+            lines.append("- （空）")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _global_memory_markdown(workspace_root: Path) -> str:
+    raw = _load_text_file(_global_memory_file(workspace_root)).strip()
+    if raw:
+        return raw
+    return "# Global Memory\n\n## User Preferences\n- （空）\n\n## Project Rules\n- （空）\n\n## Stable Decisions\n- （空）\n\n## Common Pitfalls\n- （空）"
+
+
+def _load_session_memory(workspace_root: Path, session_id: str) -> dict[str, Any]:
+    return _normalize_session_memory(
+        _load_json_file(_session_memory_file(workspace_root, session_id), _default_session_memory())
+    )
+
+
+def _save_session_memory(
+    workspace_root: Path,
+    session_id: str,
+    session_memory: dict[str, Any],
+) -> None:
+    _save_json_file(_session_memory_file(workspace_root, session_id), _normalize_session_memory(session_memory))
+
+
+def _session_compacted_upto(session: dict[str, Any]) -> int:
+    return max(0, int(session.get("memory_compacted_upto", 0) or 0))
+
+
+def _set_session_compacted_upto(session: dict[str, Any], value: int) -> None:
+    session["memory_compacted_upto"] = max(0, int(value))
+
+
+def _compaction_cutoff(conversation: list[dict[str, Any]], recent_turns: int) -> int:
+    if not conversation:
+        return 0
+
+    user_positions = [
+        index
+        for index, item in enumerate(conversation)
+        if str(item.get("role", "")).strip() == "user"
+    ]
+    if len(user_positions) <= recent_turns:
+        return 0
+    return user_positions[-recent_turns]
+
+
+def _tokenizer_for_model(model: str):
+    try:
+        return tiktoken.encoding_for_model(model)
+    except Exception:
+        return tiktoken.get_encoding("cl100k_base")
+
+
+@lru_cache(maxsize=32)
+def _cached_encoding(model: str):
+    return _tokenizer_for_model(model)
+
+
+def _count_tokens(text: str, model: str) -> int:
+    if not text:
+        return 0
+    try:
+        return len(_cached_encoding(model).encode(text))
+    except Exception:
+        return max(1, len(text) // 4)
+
+
+def _count_payload_tokens(
+    *,
+    instructions: str,
+    conversation: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    model: str,
+) -> int:
+    payload = {
+        "instructions": instructions,
+        "conversation": conversation,
+        "tools": tools,
+    }
+    return _count_tokens(json.dumps(payload, ensure_ascii=False, sort_keys=True), model)
+
+
+def _conversation_to_transcript(conversation: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for item in conversation:
+        item_type = str(item.get("type", "")).strip()
+        role = str(item.get("role", "")).strip()
+        if item_type == "function_call":
+            lines.append(
+                "工具调用："
+                f"{item.get('name', '')} {item.get('arguments', '')}"
+            )
+        elif item_type == "function_call_output":
+            lines.append(f"工具结果：{item.get('output', '')}")
+        elif role == "user":
+            lines.append(f"用户：{item.get('content', '')}")
+        elif role == "assistant":
+            lines.append(f"助手：{item.get('content', '')}")
+    return "\n".join(lines).strip()
+
+
+def _visible_conversation(
+    conversation: list[dict[str, Any]],
+    recent_turns: int,
+) -> list[dict[str, Any]]:
+    if recent_turns <= 0 or not conversation:
+        return []
+
+    user_positions = [
+        index
+        for index, item in enumerate(conversation)
+        if str(item.get("role", "")).strip() == "user"
+    ]
+    if len(user_positions) <= recent_turns:
+        return list(conversation)
+
+    start_index = user_positions[-recent_turns]
+    return list(conversation[start_index:])
+
+
+def _build_instructions(
+    *,
+    workspace_root: Path,
+    session_memory: dict[str, Any],
+) -> str:
+    global_memory = _global_memory_markdown(workspace_root)
+    session_memory_text = _session_memory_markdown(session_memory)
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"全局记忆：\n{global_memory}\n\n"
+        f"会话记忆：\n{session_memory_text}"
+    )
+
+
+def _fit_visible_conversation(
+    *,
+    conversation: list[dict[str, Any]],
+    workspace_root: Path,
+    settings: Settings,
+    session_memory: dict[str, Any],
+) -> tuple[list[dict[str, Any]], int]:
+    instructions = _build_instructions(
+        workspace_root=workspace_root,
+        session_memory=session_memory,
+    )
+    max_turns = min(settings.recent_turns, len(
+        [item for item in conversation if str(item.get("role", "")).strip() == "user"]
+    ))
+    max_turns = max(max_turns, 1)
+
+    for turns in range(max_turns, 0, -1):
+        visible = _visible_conversation(conversation, turns)
+        token_count = _count_payload_tokens(
+            instructions=instructions,
+            conversation=visible,
+            tools=tool_definitions(),
+            model=settings.model,
+        )
+        if token_count <= settings.context_token_limit or turns == 1:
+            return visible, token_count
+
+    return list(conversation), _count_payload_tokens(
+        instructions=instructions,
+        conversation=conversation,
+        tools=tool_definitions(),
+        model=settings.model,
+    )
+
+
+def _summarize_session_memory(
+    *,
+    conversation: list[dict[str, Any]],
+    client: Any,
+    settings: Settings,
+) -> dict[str, Any]:
+    transcript = _conversation_to_transcript(conversation)
+    if not transcript:
+        return _default_session_memory()
+
+    response = request_response(
+        client,
+        model=settings.model,
+        input=[{"role": "user", "content": transcript}],
+        tools=[],
+        instructions=SESSION_SUMMARY_PROMPT,
+    )
+    text = getattr(response, "output_text", "") or ""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return _default_session_memory()
+    return _normalize_session_memory(data)
+
+
+def _update_session_memory_incrementally(
+    *,
+    current_memory: dict[str, Any],
+    new_conversation_chunk: list[dict[str, Any]],
+    client: Any,
+    settings: Settings,
+) -> dict[str, Any]:
+    chunk_text = _conversation_to_transcript(new_conversation_chunk)
+    if not chunk_text:
+        return current_memory
+
+    response = request_response(
+        client,
+        model=settings.model,
+        input=[
+            {
+                "role": "user",
+                "content": (
+                    f"当前会话记忆：\n{_session_memory_markdown(current_memory)}\n\n"
+                    f"新增历史片段：\n{chunk_text}"
+                ),
+            }
+        ],
+        tools=[],
+        instructions=SESSION_MEMORY_UPDATE_PROMPT,
+    )
+    text = getattr(response, "output_text", "") or ""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return current_memory
+    return _normalize_session_memory(data)
+
+
+def _merge_global_memory(
+    *,
+    workspace_root: Path,
+    session_memory: dict[str, Any],
+    client: Any,
+    settings: Settings,
+) -> str:
+    current_global = _global_memory_markdown(workspace_root)
+    session_memory_text = _session_memory_markdown(session_memory)
+    response = request_response(
+        client,
+        model=settings.model,
+        input=[
+            {
+                "role": "user",
+                "content": (
+                    f"现有全局 `.md`：\n{current_global}\n\n"
+                    f"本会话摘要：\n{session_memory_text}"
+                ),
+            }
+        ],
+        tools=[],
+        instructions=GLOBAL_MEMORY_MERGE_PROMPT,
+    )
+    return (getattr(response, "output_text", "") or "").strip() or current_global
+
+
+def _compact_session_memory_if_needed(
+    *,
+    workspace_root: Path,
+    active_session: dict[str, Any],
+    conversation: list[dict[str, Any]],
+    session_memory: dict[str, Any],
+    client: Any,
+    settings: Settings,
+) -> dict[str, Any]:
+    compacted_upto = _session_compacted_upto(active_session)
+    cutoff = _compaction_cutoff(conversation, settings.recent_turns)
+    if cutoff <= compacted_upto:
+        return session_memory
+
+    chunk = conversation[compacted_upto:cutoff]
+    if not chunk:
+        return session_memory
+
+    chunk_tokens = _count_tokens(_conversation_to_transcript(chunk), settings.model)
+    if chunk_tokens < settings.context_token_limit:
+        return session_memory
+
+    updated_memory = _update_session_memory_incrementally(
+        current_memory=session_memory,
+        new_conversation_chunk=chunk,
+        client=client,
+        settings=settings,
+    )
+    _save_session_memory(
+        workspace_root,
+        str(active_session["id"]),
+        updated_memory,
+    )
+    _set_session_compacted_upto(active_session, cutoff)
+    active_session["updated_at"] = time.time()
+    return updated_memory
 
 
 def _load_sessions_index(path: Path) -> list[dict[str, Any]]:
@@ -227,6 +683,7 @@ def _create_session_record(title: str = "新会话") -> dict[str, Any]:
         "created_at": now,
         "updated_at": now,
         "message_count": 0,
+        "memory_compacted_upto": 0,
     }
 
 
@@ -372,22 +829,33 @@ def _run_conversation(
     workspace_root: Path,
     client: Any | None = None,
     settings: Settings | None = None,
+    session_memory: dict[str, Any] | None = None,
     logger: Callable[[str], None] | None = print,
 ) -> str:
     settings = settings or load_settings()
     client = client or build_client(settings)
     workspace_root = workspace_root.resolve()
+    session_memory = session_memory or _default_session_memory()
     emit = logger or (lambda _: None)
 
     response = None
 
     for _ in range(settings.max_steps):
+        visible_conversation, _ = _fit_visible_conversation(
+            conversation=conversation,
+            workspace_root=workspace_root,
+            settings=settings,
+            session_memory=session_memory,
+        )
         response = request_response(
             client,
             model=settings.model,
-            input=conversation,
+            input=visible_conversation,
             tools=tool_definitions(),
-            instructions=SYSTEM_PROMPT,
+            instructions=_build_instructions(
+                workspace_root=workspace_root,
+                session_memory=session_memory,
+            ),
         )
 
         tool_calls = [
@@ -430,6 +898,33 @@ def _run_conversation(
             )
 
     raise RuntimeError("Exceeded max agent steps")
+
+
+def _finalize_session_memory(
+    *,
+    workspace_root: Path,
+    session_id: str,
+    conversation: list[dict[str, Any]],
+    client: Any,
+    settings: Settings,
+) -> dict[str, Any]:
+    if not conversation:
+        return _load_session_memory(workspace_root, session_id)
+
+    session_memory = _summarize_session_memory(
+        conversation=conversation,
+        client=client,
+        settings=settings,
+    )
+    _save_session_memory(workspace_root, session_id, session_memory)
+    merged_global_memory = _merge_global_memory(
+        workspace_root=workspace_root,
+        session_memory=session_memory,
+        client=client,
+        settings=settings,
+    )
+    _save_text_file(_global_memory_file(workspace_root), merged_global_memory)
+    return session_memory
 
 
 def run_agent(
@@ -481,65 +976,86 @@ def run_chat_session(
     active_session = _create_session_record()
     active_session_path = _session_path(workspace_root, str(active_session["id"]))
     conversation: list[dict[str, Any]] = []
+    session_memory = _default_session_memory()
     active_session_persisted = False
+
+    def finalize_current_session() -> None:
+        nonlocal sessions, session_memory, active_session_persisted
+        if not conversation:
+            return
+        sessions = _sync_session_state(
+            sessions_index_path=sessions_index_path,
+            sessions=sessions,
+            active_session=active_session,
+            active_session_path=active_session_path,
+            conversation=conversation,
+            keep_empty=active_session_persisted,
+        )
+        session_memory = _finalize_session_memory(
+            workspace_root=workspace_root,
+            session_id=str(active_session["id"]),
+            conversation=conversation,
+            client=client,
+            settings=settings,
+        )
+        active_session_persisted = True
+
+    def maybe_compact_session_memory() -> None:
+        nonlocal session_memory, sessions
+        before = _session_compacted_upto(active_session)
+        session_memory = _compact_session_memory_if_needed(
+            workspace_root=workspace_root,
+            active_session=active_session,
+            conversation=conversation,
+            session_memory=session_memory,
+            client=client,
+            settings=settings,
+        )
+        after = _session_compacted_upto(active_session)
+        if after != before:
+            sessions = _update_session_index(sessions, active_session)
+            _save_sessions_index(sessions_index_path, sessions)
 
     while True:
         try:
             user_text = input_fn("你> ").strip()
         except EOFError:
+            finalize_current_session()
             break
         except KeyboardInterrupt:
+            finalize_current_session()
             break
 
         if not user_text:
             continue
+        maybe_compact_session_memory()
         if user_text in {"/exit", "exit", "quit", "/quit"}:
-            if active_session_persisted or conversation:
-                sessions = _sync_session_state(
-                    sessions_index_path=sessions_index_path,
-                    sessions=sessions,
-                    active_session=active_session,
-                    active_session_path=active_session_path,
-                    conversation=conversation,
-                    keep_empty=active_session_persisted,
-                )
+            finalize_current_session()
             break
         if user_text in {"/reset", "reset"}:
+            finalize_current_session()
             conversation.clear()
-            if active_session_persisted:
-                sessions = _sync_session_state(
-                    sessions_index_path=sessions_index_path,
-                    sessions=sessions,
-                    active_session=active_session,
-                    active_session_path=active_session_path,
-                    conversation=conversation,
-                )
+            sessions = _sync_session_state(
+                sessions_index_path=sessions_index_path,
+                sessions=sessions,
+                active_session=active_session,
+                active_session_path=active_session_path,
+                conversation=conversation,
+                keep_empty=True,
+            )
+            session_memory = _default_session_memory()
+            active_session_persisted = False
             continue
         if user_text in {"/new", "new"}:
-            if active_session_persisted or conversation:
-                sessions = _sync_session_state(
-                    sessions_index_path=sessions_index_path,
-                    sessions=sessions,
-                    active_session=active_session,
-                    active_session_path=active_session_path,
-                    conversation=conversation,
-                    keep_empty=active_session_persisted,
-                )
+            finalize_current_session()
             active_session = _create_session_record()
             active_session_path = _session_path(workspace_root, str(active_session["id"]))
             conversation = []
+            session_memory = _default_session_memory()
             active_session_persisted = False
             continue
         if user_text in {"/choose", "choose", "/switch", "switch"}:
-            if active_session_persisted or conversation:
-                sessions = _sync_session_state(
-                    sessions_index_path=sessions_index_path,
-                    sessions=sessions,
-                    active_session=active_session,
-                    active_session_path=active_session_path,
-                    conversation=conversation,
-                    keep_empty=active_session_persisted,
-                )
+            finalize_current_session()
             selected_session = _choose_session(sessions, input_fn, emit)
             if selected_session is None:
                 continue
@@ -551,6 +1067,11 @@ def run_chat_session(
             active_session_path = _session_path(workspace_root, str(active_session["id"]))
             conversation = _load_conversation(active_session_path) if existing_session else []
             active_session_persisted = existing_session
+            session_memory = (
+                _load_session_memory(workspace_root, str(active_session["id"]))
+                if existing_session
+                else _default_session_memory()
+            )
             if existing_session:
                 active_session["message_count"] = len(conversation)
                 _print_conversation_history(conversation, emit)
@@ -570,6 +1091,7 @@ def run_chat_session(
                 workspace_root=workspace_root,
                 client=client,
                 settings=settings,
+                session_memory=session_memory,
                 logger=logger,
             )
         except RuntimeError as exc:

@@ -3,8 +3,122 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import nju_agent.__main__ as main_module
-from nju_agent.agent import run_agent, run_chat_session
+from nju_agent.agent import (
+    _compact_session_memory_if_needed,
+    _visible_conversation,
+    run_agent,
+    run_chat_session,
+)
 from nju_agent.config import Settings
+
+
+def _message_response(text: str, *, id_suffix: str = "msg") -> SimpleNamespace:
+    return SimpleNamespace(
+        id=f"resp-{id_suffix}",
+        output=[
+            SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="output_text", text=text)],
+            )
+        ],
+        output_text=text,
+    )
+
+
+def _empty_response(text: str = "") -> SimpleNamespace:
+    return SimpleNamespace(id="resp-empty", output=[], output_text=text)
+
+
+def _summary_response() -> SimpleNamespace:
+    return _message_response(
+        json.dumps(
+            {
+                "goal": "实现多会话和历史回放",
+                "decisions": ["会话默认新建", "会话选择通过 /choose"],
+                "important_files": ["src/src/nju_agent/agent.py"],
+                "open_tasks": ["加入 history 展示"],
+                "user_preferences": [],
+                "notes": [],
+            },
+            ensure_ascii=False,
+        ),
+        id_suffix="summary",
+    )
+
+
+def _global_memory_response() -> SimpleNamespace:
+    return _message_response(
+        "# Global Memory\n\n## User Preferences\n- 输出简洁\n",
+        id_suffix="global",
+    )
+
+
+def _incremental_memory_response() -> SimpleNamespace:
+    return _message_response(
+        json.dumps(
+            {
+                "goal": "继续整理上下文",
+                "decisions": ["保留最近 4 轮"],
+                "important_files": ["src/src/nju_agent/agent.py"],
+                "open_tasks": ["继续压缩旧历史"],
+                "user_preferences": ["输出简洁"],
+                "notes": [],
+            },
+            ensure_ascii=False,
+        ),
+        id_suffix="memory",
+    )
+
+
+class SequencedResponses:
+    def __init__(self, responses: list[SimpleNamespace]) -> None:
+        self.responses = responses
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        index = min(len(self.calls) - 1, len(self.responses) - 1)
+        return self.responses[index]
+
+
+def test_compact_session_memory_if_needed_updates_memory(tmp_path: Path) -> None:
+    session = {"id": "abc", "memory_compacted_upto": 0, "updated_at": 1.0}
+    conversation = []
+    for i in range(6):
+        conversation.append({"role": "user", "content": f"u{i}"})
+        conversation.append({"role": "assistant", "content": f"a{i}"})
+
+    responses = SequencedResponses([_incremental_memory_response()])
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = responses
+
+    settings = Settings(
+        api_key="key",
+        model="deepseek-test",
+        context_token_limit=1,
+        recent_turns=4,
+    )
+    memory = _compact_session_memory_if_needed(
+        workspace_root=tmp_path,
+        active_session=session,
+        conversation=conversation,
+        session_memory={
+            "goal": "",
+            "decisions": [],
+            "important_files": [],
+            "open_tasks": [],
+            "user_preferences": [],
+            "notes": [],
+        },
+        client=FakeClient(),
+        settings=settings,
+    )
+
+    assert memory["goal"] == "继续整理上下文"
+    assert session["memory_compacted_upto"] > 0
+    assert (tmp_path / ".nju_agent" / "memory" / "abc.json").exists()
 
 
 def test_run_agent_handles_tool_call_then_completion(tmp_path: Path) -> None:
@@ -55,6 +169,25 @@ def test_run_agent_handles_tool_call_then_completion(tmp_path: Path) -> None:
     assert calls[1]["input"][-1]["type"] == "function_call_output"
 
 
+def test_visible_conversation_keeps_recent_user_turns() -> None:
+    conversation = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+        {"role": "user", "content": "u3"},
+        {"role": "assistant", "content": "a3"},
+        {"role": "user", "content": "u4"},
+        {"role": "assistant", "content": "a4"},
+        {"role": "user", "content": "u5"},
+        {"role": "assistant", "content": "a5"},
+    ]
+
+    visible = _visible_conversation(conversation, 4)
+
+    assert [item["content"] for item in visible if item["role"] == "user"] == ["u2", "u3", "u4", "u5"]
+
+
 def test_main_uses_settings_and_chat_session(monkeypatch) -> None:
     captured = {}
 
@@ -74,27 +207,18 @@ def test_main_uses_settings_and_chat_session(monkeypatch) -> None:
 
 
 def test_run_chat_session_keeps_conversation_history(tmp_path: Path) -> None:
-    calls = []
-
-    class FakeResponses:
-        def create(self, **kwargs):
-            calls.append(kwargs)
-            return SimpleNamespace(
-                id=f"resp-{len(calls)}",
-                output=[
-                    SimpleNamespace(
-                        type="message",
-                        content=[
-                            SimpleNamespace(type="output_text", text=f"done-{len(calls)}"),
-                        ],
-                    )
-                ],
-                output_text=f"done-{len(calls)}",
-            )
+    responses = SequencedResponses(
+        [
+            _message_response("done-1", id_suffix="1"),
+            _message_response("done-2", id_suffix="2"),
+            _summary_response(),
+            _global_memory_response(),
+        ]
+    )
 
     class FakeClient:
         def __init__(self) -> None:
-            self.responses = FakeResponses()
+            self.responses = responses
 
     inputs = iter(["first task", "second task", "/exit"])
     logs: list[str] = []
@@ -107,15 +231,18 @@ def test_run_chat_session_keeps_conversation_history(tmp_path: Path) -> None:
         input_fn=lambda _: next(inputs),
     )
 
-    assert calls[0]["input"][0]["content"] == "first task"
-    assert any(item.get("content") == "second task" for item in calls[1]["input"])
-    assert any(item.get("content") == "done-1" for item in calls[1]["input"])
+    assert responses.calls[0]["input"][0]["content"] == "first task"
+    assert any(item.get("content") == "second task" for item in responses.calls[1]["input"])
+    assert any(item.get("content") == "done-1" for item in responses.calls[1]["input"])
     assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话"
     assert logs[1:] == ["最终结果：done-1", "最终结果：done-2"]
     sessions = json.loads((tmp_path / ".nju_agent" / "sessions.json").read_text(encoding="utf-8"))
     assert len(sessions) == 1
     assert sessions[0]["message_count"] == 4
     assert (tmp_path / ".nju_agent" / "sessions" / f"{sessions[0]['id']}.json").exists()
+    assert (tmp_path / ".nju_agent" / "memory" / f"{sessions[0]['id']}.json").exists()
+    assert (tmp_path / ".nju_agent" / "global_memory.md").exists()
+    assert len(responses.calls) == 4
 
 
 def test_run_chat_session_starts_new_session_by_default(tmp_path: Path) -> None:
@@ -136,16 +263,17 @@ def test_run_chat_session_starts_new_session_by_default(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    calls = []
-
-    class FakeResponses:
-        def create(self, **kwargs):
-            calls.append(kwargs)
-            return SimpleNamespace(id="resp-1", output=[], output_text="done")
+    responses = SequencedResponses(
+        [
+            _empty_response("done"),
+            _summary_response(),
+            _global_memory_response(),
+        ]
+    )
 
     class FakeClient:
         def __init__(self) -> None:
-            self.responses = FakeResponses()
+            self.responses = responses
 
     inputs = iter(["new task", "/exit"])
     logs: list[str] = []
@@ -158,8 +286,8 @@ def test_run_chat_session_starts_new_session_by_default(tmp_path: Path) -> None:
         input_fn=lambda _: next(inputs),
     )
 
-    assert all(item.get("content") != "old" for item in calls[0]["input"])
-    assert any(item.get("content") == "new task" for item in calls[0]["input"])
+    assert all(item.get("content") != "old" for item in responses.calls[0]["input"])
+    assert any(item.get("content") == "new task" for item in responses.calls[0]["input"])
     assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话"
     assert logs[1] == "最终结果：done"
 
@@ -182,16 +310,17 @@ def test_run_chat_session_choose_loads_saved_history(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    calls = []
-
-    class FakeResponses:
-        def create(self, **kwargs):
-            calls.append(kwargs)
-            return SimpleNamespace(id="resp-1", output=[], output_text="done")
+    responses = SequencedResponses(
+        [
+            _empty_response("done"),
+            _summary_response(),
+            _global_memory_response(),
+        ]
+    )
 
     class FakeClient:
         def __init__(self) -> None:
-            self.responses = FakeResponses()
+            self.responses = responses
 
     inputs = iter(["/choose", "1", "new task", "/exit"])
     logs: list[str] = []
@@ -204,8 +333,8 @@ def test_run_chat_session_choose_loads_saved_history(tmp_path: Path) -> None:
         input_fn=lambda _: next(inputs),
     )
 
-    assert calls[0]["input"][0]["content"] == "old"
-    assert any(item.get("content") == "new task" for item in calls[0]["input"])
+    assert responses.calls[0]["input"][0]["content"] == "old"
+    assert any(item.get("content") == "new task" for item in responses.calls[0]["input"])
     assert any(line == "可用会话：" for line in logs)
     assert any(line == "1. 旧会话" for line in logs)
     assert any(line == "历史消息：" for line in logs)
@@ -232,16 +361,17 @@ def test_run_chat_session_choose_back_returns_to_current_session(tmp_path: Path)
         encoding="utf-8",
     )
 
-    calls = []
-
-    class FakeResponses:
-        def create(self, **kwargs):
-            calls.append(kwargs)
-            return SimpleNamespace(id="resp-1", output=[], output_text="done")
+    responses = SequencedResponses(
+        [
+            _empty_response("done"),
+            _summary_response(),
+            _global_memory_response(),
+        ]
+    )
 
     class FakeClient:
         def __init__(self) -> None:
-            self.responses = FakeResponses()
+            self.responses = responses
 
     inputs = iter(["/choose", "b", "new task", "/exit"])
     logs: list[str] = []
@@ -254,8 +384,8 @@ def test_run_chat_session_choose_back_returns_to_current_session(tmp_path: Path)
         input_fn=lambda _: next(inputs),
     )
 
-    assert all(item.get("content") != "old" for item in calls[0]["input"])
-    assert any(item.get("content") == "new task" for item in calls[0]["input"])
+    assert all(item.get("content") != "old" for item in responses.calls[0]["input"])
+    assert any(item.get("content") == "new task" for item in responses.calls[0]["input"])
     assert any(line == "b. 返回" for line in logs)
 
 
@@ -283,7 +413,10 @@ def test_run_chat_session_reset_clears_history(tmp_path: Path) -> None:
 
     class FakeClient:
         def __init__(self) -> None:
-            self.responses = FakeResponses()
+            self.responses = SequencedResponses([
+                _summary_response(),
+                _global_memory_response(),
+            ])
 
     inputs = iter(["/choose", "1", "/reset", "/exit"])
 
@@ -301,16 +434,17 @@ def test_run_chat_session_reset_clears_history(tmp_path: Path) -> None:
 
 
 def test_new_session_title_uses_first_user_message(tmp_path: Path) -> None:
-    calls = []
-
-    class FakeResponses:
-        def create(self, **kwargs):
-            calls.append(kwargs)
-            return SimpleNamespace(id="resp-1", output=[], output_text="done")
+    responses = SequencedResponses(
+        [
+            _empty_response("done"),
+            _summary_response(),
+            _global_memory_response(),
+        ]
+    )
 
     class FakeClient:
         def __init__(self) -> None:
-            self.responses = FakeResponses()
+            self.responses = responses
 
     sessions_path = tmp_path / ".nju_agent" / "sessions.json"
     sessions_path.parent.mkdir(parents=True, exist_ok=True)

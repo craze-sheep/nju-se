@@ -17,6 +17,8 @@ def test_load_settings_reads_environment_values() -> None:
     assert settings.base_url == "https://example.com/v1"
     assert settings.model == "deepseek-test"
     assert settings.max_steps == 12
+    assert settings.context_token_limit == 96000
+    assert settings.recent_turns == 4
 
 
 def test_load_settings_requires_api_key() -> None:
