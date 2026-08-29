@@ -11,11 +11,12 @@
 - 通过本地工具读文件、写文件、运行命令
 - 把工具结果再回传给模型
 - 最后输出完成结果
+- 可选打开 planner / reviewer 轻量分工，但 executor 仍是唯一执行者
 
 ## 这一版不做什么
 
 - 不做网页界面
-- 不做多智能体
+- 不做完整多智能体编队
 - 不做长期记忆
 - 不接现成 agent 框架 / SDK
 - 不做复杂权限系统，只做会话级只读 / 可写切换
@@ -37,6 +38,7 @@
 - DeepSeek 调用封装
 - 本地文件和命令工具
 - Agent 循环
+- 可选 planner / reviewer 分工模式
 
 运行时仍遵守题目要求：
 
@@ -45,6 +47,8 @@
 - API key 只从环境变量读取
 - 工具逻辑在本地自行实现
 - 默认只读，需要时可用 `/access` 切到可写
+- 输入 `/subagents` 可以打开或关闭轻量 subagent 分工；planner / reviewer 不带工具权限
+- `run_command` 默认走 Docker 常驻沙箱容器；`NJU_AGENT_RUN_COMMAND_MODE=local` 仅用于显式开发模式
 
 启动后直接进入对话模式：
 

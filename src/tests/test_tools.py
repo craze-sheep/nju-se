@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import nju_agent.tools as tools_mod
 from nju_agent.tools import list_files, read_file, revert_write_file, run_command, write_file
 
 
@@ -49,14 +50,116 @@ def test_write_file_rejects_escape_outside_root(tmp_path: Path) -> None:
         write_file(str(tmp_path), "../outside.txt", "nope")
 
 
-def test_run_command_returns_exit_code_and_stdout(tmp_path: Path) -> None:
+def test_run_command_returns_exit_code_and_stdout_local_mode(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("NJU_AGENT_RUN_COMMAND_MODE", "local")
     result = run_command(str(tmp_path), [sys.executable, "-c", "print('hello nju')"])
 
     assert result.exit_code == 0
     assert result.stdout.strip() == "hello nju"
 
 
-def test_run_command_times_out(tmp_path: Path) -> None:
+def test_run_command_times_out_local_mode(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("NJU_AGENT_RUN_COMMAND_MODE", "local")
+    with pytest.raises(TimeoutError):
+        run_command(str(tmp_path), [sys.executable, "-c", "import time; time.sleep(1)"], timeout=0.1)
+
+
+def test_run_command_uses_persistent_docker_container(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("NJU_AGENT_RUN_COMMAND_MODE", raising=False)
+
+    calls: list[list[str]] = []
+    state = {
+        "image_built": False,
+        "container_created": False,
+        "container_running": False,
+        "exec_calls": 0,
+    }
+    image_name = "nju-agent-sandbox:latest"
+    container_name = f"nju_agent_sandbox_{tools_mod._workspace_hash(str(tmp_path))}"
+
+    def fake_run(
+        args,
+        cwd=None,
+        input=None,
+        text=None,
+        capture_output=None,
+        timeout=None,
+        check=None,
+    ):
+        calls.append(list(args))
+        if args[:4] == ["docker", "image", "inspect", image_name]:
+            if state["image_built"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return subprocess.CompletedProcess(args, 1, "", "missing")
+        if args[:2] == ["docker", "build"]:
+            state["image_built"] = True
+            return subprocess.CompletedProcess(args, 0, "built", "")
+        if args[:4] == ["docker", "container", "inspect", "--format"] and args[4] == "{{.Config.Image}}":
+            if state["container_created"]:
+                return subprocess.CompletedProcess(args, 0, image_name, "")
+            return subprocess.CompletedProcess(args, 1, "", "missing")
+        if args[:4] == ["docker", "container", "inspect", "--format"] and args[4] == "{{.State.Status}}":
+            if state["container_running"]:
+                return subprocess.CompletedProcess(args, 0, "running\n", "")
+            if state["container_created"]:
+                return subprocess.CompletedProcess(args, 0, "exited\n", "")
+            return subprocess.CompletedProcess(args, 1, "", "missing")
+        if args[:2] == ["docker", "rm"]:
+            state["container_created"] = False
+            state["container_running"] = False
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[:2] == ["docker", "run"]:
+            state["container_created"] = True
+            state["container_running"] = True
+            return subprocess.CompletedProcess(args, 0, "container-id\n", "")
+        if args[:2] == ["docker", "start"]:
+            state["container_running"] = True
+            return subprocess.CompletedProcess(args, 0, "container-id\n", "")
+        if args[:2] == ["docker", "exec"]:
+            state["exec_calls"] += 1
+            return subprocess.CompletedProcess(args, 0, "hello nju\n", "")
+        raise AssertionError(f"Unexpected command: {args}")
+
+    monkeypatch.setattr(tools_mod.subprocess, "run", fake_run)
+
+    first = run_command(str(tmp_path), [sys.executable, "-c", "print('hello nju')"], timeout=5)
+    second = run_command(str(tmp_path), [sys.executable, "-c", "print('hello nju again')"], timeout=5)
+
+    assert first.exit_code == 0
+    assert first.stdout.strip() == "hello nju"
+    assert second.exit_code == 0
+    assert state["exec_calls"] == 2
+    assert sum(1 for call in calls if call[:2] == ["docker", "build"]) == 1
+    assert sum(1 for call in calls if call[:2] == ["docker", "run"]) == 1
+    assert any(call[:3] == ["docker", "run", "-d"] and container_name in call for call in calls)
+    assert any(call[:2] == ["docker", "exec"] and "timeout" in call for call in calls)
+
+
+def test_run_command_docker_timeout_maps_to_timeout_error(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("NJU_AGENT_RUN_COMMAND_MODE", raising=False)
+    monkeypatch.setenv("NJU_AGENT_SANDBOX_IMAGE", "nju-agent-sandbox:latest")
+
+    def fake_run(
+        args,
+        cwd=None,
+        input=None,
+        text=None,
+        capture_output=None,
+        timeout=None,
+        check=None,
+    ):
+        if args[:4] == ["docker", "image", "inspect", "nju-agent-sandbox:latest"]:
+            return subprocess.CompletedProcess(args, 0, "exists", "")
+        if args[:4] == ["docker", "container", "inspect", "--format"] and args[4] == "{{.Config.Image}}":
+            return subprocess.CompletedProcess(args, 0, "nju-agent-sandbox:latest", "")
+        if args[:4] == ["docker", "container", "inspect", "--format"] and args[4] == "{{.State.Status}}":
+            return subprocess.CompletedProcess(args, 0, "running\n", "")
+        if args[:2] == ["docker", "exec"]:
+            return subprocess.CompletedProcess(args, 124, "", "")
+        raise AssertionError(f"Unexpected command: {args}")
+
+    monkeypatch.setattr(tools_mod.subprocess, "run", fake_run)
+
     with pytest.raises(TimeoutError):
         run_command(str(tmp_path), [sys.executable, "-c", "import time; time.sleep(1)"], timeout=0.1)
 

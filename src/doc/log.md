@@ -187,3 +187,32 @@ python -m compileall 1.0/src/nju_agent
 - 只读时只暴露 `list_files` / `read_file`。
 - 只读时对 `write_file` / `run_command` 做执行期拦截。
 - 更新相关测试。
+
+## 2026-08-29
+
+### 轻量 subagent 分工
+
+目标：
+
+- 在不引入 agent 框架、不增加多个执行者的前提下，加入可选 planner / reviewer 分工。
+- planner 只负责规划，reviewer 只负责审查，executor 仍沿用现有工具调用循环。
+
+已完成：
+
+- 新增 planner / reviewer prompt。
+- 新增 `/subagents` 命令，用于打开或关闭分工模式。
+- planner / reviewer 调用不暴露任何本地工具。
+- reviewer 可要求 executor 最多再执行一轮修正。
+- 为 `run_agent` 和交互式会话补充相关测试。
+
+验证命令：
+
+```bash
+PYTHONPATH=src/src pytest src/tests -q
+```
+
+验证结果：
+
+```text
+25 passed
+```

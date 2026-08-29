@@ -24,6 +24,23 @@ Use the available tools to complete the user's task.
 Keep file operations inside the workspace root.
 When you finish, answer briefly in Chinese."""
 
+PLANNER_PROMPT = """你是一个 coding agent 的 planner。
+只负责拆解任务、识别依赖和风险，给 executor 一份简短可执行的计划。
+不要调用工具，不要写代码，不要夸大完成度。
+输出中文，尽量使用简洁的条目列表。"""
+
+REVIEWER_PROMPT = """你是一个 coding agent 的 reviewer。
+只负责审查 executor 的结果、工具输出和文件差异。
+重点检查遗漏、明显 bug、测试风险、权限问题和是否需要再跑一轮。
+不要调用工具，不要直接修改文件。
+输出必须是严格 JSON，格式如下：
+{
+  "summary": "",
+  "issues": [],
+  "needs_retry": false,
+  "retry_advice": ""
+}"""
+
 ACCESS_READ_ONLY = "read_only"
 ACCESS_WRITE = "write"
 
@@ -108,6 +125,18 @@ def _access_mode_label(access_mode: str) -> str:
 
 def _can_use_write_tools(access_mode: str) -> bool:
     return _normalize_access_mode(access_mode) == ACCESS_WRITE
+
+
+def _subagents_enabled_label(enabled: bool) -> str:
+    return "开启" if enabled else "关闭"
+
+
+def _session_subagents_enabled(session: dict[str, Any]) -> bool:
+    return bool(session.get("subagents_enabled", False))
+
+
+def _set_session_subagents_enabled(session: dict[str, Any], enabled: bool) -> None:
+    session["subagents_enabled"] = bool(enabled)
 
 
 def tool_definitions(access_mode: str = ACCESS_READ_ONLY) -> list[dict[str, Any]]:
@@ -652,15 +681,152 @@ def _build_instructions(
     workspace_root: Path,
     session_memory: dict[str, Any],
     access_mode: str,
+    task_plan: str = "",
+    reviewer_feedback: str = "",
 ) -> str:
     global_memory = _global_memory_markdown(workspace_root)
     session_memory_text = _session_memory_markdown(session_memory)
+    extra_sections: list[str] = []
+    if task_plan.strip():
+        extra_sections.append(f"规划建议：\n{task_plan.strip()}")
+    if reviewer_feedback.strip():
+        extra_sections.append(f"审查反馈：\n{reviewer_feedback.strip()}")
+    extra_text = "\n\n".join(extra_sections)
     return (
         f"{SYSTEM_PROMPT}\n\n"
         f"当前会话权限：{_access_mode_label(access_mode)}\n\n"
         f"全局记忆：\n{global_memory}\n\n"
         f"会话记忆：\n{session_memory_text}"
+        + (f"\n\n{extra_text}" if extra_text else "")
     )
+
+
+def _planner_context_text(
+    *,
+    task: str,
+    conversation: list[dict[str, Any]],
+    session_memory: dict[str, Any],
+    access_mode: str,
+) -> str:
+    recent_context = _conversation_to_transcript(conversation).strip()
+    parts = [
+        f"用户任务：\n{task.strip()}",
+        f"当前权限：{_access_mode_label(access_mode)}",
+        f"会话记忆：\n{_session_memory_markdown(session_memory)}",
+    ]
+    if recent_context:
+        parts.append(f"最近对话：\n{recent_context}")
+    return "\n\n".join(parts)
+
+
+def _review_context_text(
+    *,
+    task: str,
+    plan: str,
+    final_text: str,
+    diff_text: str,
+    session_memory: dict[str, Any],
+    access_mode: str,
+) -> str:
+    parts = [
+        f"用户任务：\n{task.strip()}",
+        f"执行计划：\n{plan.strip() or '（空）'}",
+        f"执行结果：\n{final_text.strip() or '（空）'}",
+        f"文件差异：\n{diff_text.strip() or '（空）'}",
+        f"当前权限：{_access_mode_label(access_mode)}",
+        f"会话记忆：\n{_session_memory_markdown(session_memory)}",
+    ]
+    return "\n\n".join(parts)
+
+
+def _generate_task_plan(
+    *,
+    task: str,
+    conversation: list[dict[str, Any]],
+    session_memory: dict[str, Any],
+    access_mode: str,
+    client: Any,
+    settings: Settings,
+) -> str:
+    response = request_response(
+        client,
+        model=settings.model,
+        input=[
+            {
+                "role": "user",
+                "content": _planner_context_text(
+                    task=task,
+                    conversation=conversation,
+                    session_memory=session_memory,
+                    access_mode=access_mode,
+                ),
+            }
+        ],
+        tools=[],
+        instructions=PLANNER_PROMPT,
+    )
+    return (getattr(response, "output_text", "") or "").strip()
+
+
+def _parse_reviewer_result(text: str) -> dict[str, Any]:
+    default = {
+        "summary": "",
+        "issues": [],
+        "needs_retry": False,
+        "retry_advice": "",
+    }
+    if not text.strip():
+        return default
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        default["summary"] = text.strip()
+        return default
+    if not isinstance(data, dict):
+        return default
+    summary = str(data.get("summary", "")).strip()
+    retry_advice = str(data.get("retry_advice", "")).strip()
+    issues = _normalize_string_list(data.get("issues", []))
+    needs_retry = bool(data.get("needs_retry", False))
+    return {
+        "summary": summary,
+        "issues": issues,
+        "needs_retry": needs_retry,
+        "retry_advice": retry_advice,
+    }
+
+
+def _review_task_result(
+    *,
+    task: str,
+    plan: str,
+    final_text: str,
+    diff_text: str,
+    session_memory: dict[str, Any],
+    access_mode: str,
+    client: Any,
+    settings: Settings,
+) -> dict[str, Any]:
+    response = request_response(
+        client,
+        model=settings.model,
+        input=[
+            {
+                "role": "user",
+                "content": _review_context_text(
+                    task=task,
+                    plan=plan,
+                    final_text=final_text,
+                    diff_text=diff_text,
+                    session_memory=session_memory,
+                    access_mode=access_mode,
+                ),
+            }
+        ],
+        tools=[],
+        instructions=REVIEWER_PROMPT,
+    )
+    return _parse_reviewer_result((getattr(response, "output_text", "") or "").strip())
 
 
 def _fit_visible_conversation(
@@ -670,11 +836,15 @@ def _fit_visible_conversation(
     settings: Settings,
     session_memory: dict[str, Any],
     access_mode: str,
+    task_plan: str = "",
+    reviewer_feedback: str = "",
 ) -> tuple[list[dict[str, Any]], int]:
     instructions = _build_instructions(
         workspace_root=workspace_root,
         session_memory=session_memory,
         access_mode=access_mode,
+        task_plan=task_plan,
+        reviewer_feedback=reviewer_feedback,
     )
     max_turns = min(settings.recent_turns, len(
         [item for item in conversation if str(item.get("role", "")).strip() == "user"]
@@ -905,6 +1075,7 @@ def _create_session_record(title: str = "新会话") -> dict[str, Any]:
         "message_count": 0,
         "memory_compacted_upto": 0,
         "access_mode": ACCESS_READ_ONLY,
+        "subagents_enabled": False,
     }
 
 
@@ -955,6 +1126,28 @@ def _choose_access_mode(
         if choice == "2":
             return ACCESS_WRITE
         emit("输入无效，请重新选择")
+
+
+def _parse_subagents_command(user_text: str, current_state: bool) -> bool | None:
+    parts = user_text.strip().split()
+    if not parts:
+        return None
+
+    command = parts[0].lower()
+    if command not in {"/subagents", "subagents", "/roles", "roles"}:
+        return None
+
+    if len(parts) == 1:
+        return not current_state
+
+    option = parts[1].strip().lower()
+    if option in {"1", "off", "false", "disable", "disabled", "关", "关闭"}:
+        return False
+    if option in {"2", "on", "true", "enable", "enabled", "开", "开启"}:
+        return True
+    if option in {"toggle", "t"}:
+        return not current_state
+    return None
 
 
 def _sync_session_state(
@@ -1106,8 +1299,11 @@ def _run_conversation(
     settings: Settings | None = None,
     session_memory: dict[str, Any] | None = None,
     access_mode: str = ACCESS_WRITE,
+    task_plan: str = "",
+    reviewer_feedback: str = "",
     write_changes: list[dict[str, Any]] | None = None,
     logger: Callable[[str], None] | None = print,
+    emit_final_result: bool = True,
 ) -> str:
     settings = settings or load_settings()
     client = client or build_client(settings)
@@ -1124,6 +1320,8 @@ def _run_conversation(
             settings=settings,
             session_memory=session_memory,
             access_mode=access_mode,
+            task_plan=task_plan,
+            reviewer_feedback=reviewer_feedback,
         )
         response = request_response(
             client,
@@ -1134,6 +1332,8 @@ def _run_conversation(
                 workspace_root=workspace_root,
                 session_memory=session_memory,
                 access_mode=access_mode,
+                task_plan=task_plan,
+                reviewer_feedback=reviewer_feedback,
             ),
         )
 
@@ -1150,7 +1350,8 @@ def _run_conversation(
 
         if not tool_calls:
             final_text = getattr(response, "output_text", "") or ""
-            emit(f"最终结果：{final_text}")
+            if emit_final_result:
+                emit(f"最终结果：{final_text}")
             return final_text
 
         for item in tool_calls:
@@ -1183,6 +1384,85 @@ def _run_conversation(
             )
 
     raise RuntimeError("Exceeded max agent steps")
+
+
+def _run_task_with_optional_subagents(
+    *,
+    task: str,
+    conversation: list[dict[str, Any]],
+    workspace_root: Path,
+    client: Any,
+    settings: Settings,
+    session_memory: dict[str, Any],
+    access_mode: str,
+    subagents_enabled: bool,
+    write_changes: list[dict[str, Any]] | None = None,
+    logger: Callable[[str], None] | None = print,
+) -> str:
+    emit = logger or (lambda _: None)
+    task_plan = ""
+    if subagents_enabled:
+        task_plan = _generate_task_plan(
+            task=task,
+            conversation=conversation,
+            session_memory=session_memory,
+            access_mode=access_mode,
+            client=client,
+            settings=settings,
+        )
+        if task_plan:
+            emit(f"规划：{task_plan}")
+
+    final_text = _run_conversation(
+        conversation,
+        workspace_root=workspace_root,
+        client=client,
+        settings=settings,
+        session_memory=session_memory,
+        access_mode=access_mode,
+        task_plan=task_plan,
+        write_changes=write_changes,
+        logger=logger,
+        emit_final_result=False,
+    )
+
+    if not subagents_enabled:
+        emit(f"最终结果：{final_text}")
+        return final_text
+
+    diff_text = _format_write_batch_diff({"changes": write_changes or []})
+    review = _review_task_result(
+        task=task,
+        plan=task_plan,
+        final_text=final_text,
+        diff_text=diff_text,
+        session_memory=session_memory,
+        access_mode=access_mode,
+        client=client,
+        settings=settings,
+    )
+    if review["summary"]:
+        emit(f"审查：{review['summary']}")
+    if review["issues"]:
+        emit(f"审查问题：{'；'.join(review['issues'])}")
+    if review["needs_retry"] and review["retry_advice"]:
+        emit(f"审查建议重试：{review['retry_advice']}")
+        final_text = _run_conversation(
+            conversation,
+            workspace_root=workspace_root,
+            client=client,
+            settings=settings,
+            session_memory=session_memory,
+            access_mode=access_mode,
+            task_plan=task_plan,
+            reviewer_feedback=review["retry_advice"],
+            write_changes=write_changes,
+            logger=logger,
+            emit_final_result=False,
+        )
+
+    emit(f"最终结果：{final_text}")
+    return final_text
 
 
 def _finalize_session_memory(
@@ -1219,15 +1499,23 @@ def run_agent(
     client: Any | None = None,
     settings: Settings | None = None,
     access_mode: str = ACCESS_READ_ONLY,
+    subagents_enabled: bool = False,
     logger: Callable[[str], None] | None = print,
 ) -> str:
+    settings = settings or load_settings()
+    client = client or build_client(settings)
     conversation: list[dict[str, Any]] = [{"role": "user", "content": task}]
-    return _run_conversation(
-        conversation,
+    write_changes: list[dict[str, Any]] = []
+    return _run_task_with_optional_subagents(
+        task=task,
+        conversation=conversation,
         workspace_root=workspace_root,
         client=client,
         settings=settings,
+        session_memory=_default_session_memory(),
         access_mode=access_mode,
+        subagents_enabled=subagents_enabled,
+        write_changes=write_changes,
         logger=logger,
     )
 
@@ -1240,6 +1528,7 @@ def run_chat_session(
     logger: Callable[[str], None] | None = print,
     input_fn: Callable[[str], str] = input,
     background_finalize: bool = False,
+    subagents_enabled: bool = False,
 ) -> None:
     settings = settings or load_settings()
     client = client or build_client(settings)
@@ -1263,6 +1552,7 @@ def run_chat_session(
     emit("进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/access 切换权限，/diff 查看差异，/undo 撤销写入")
 
     active_session = _create_session_record()
+    _set_session_subagents_enabled(active_session, subagents_enabled)
     active_session_path = _session_path(workspace_root, str(active_session["id"]))
     conversation: list[dict[str, Any]] = []
     session_memory = _default_session_memory()
@@ -1392,6 +1682,21 @@ def run_chat_session(
             )
             emit(f"当前权限已切换为：{_access_mode_label(selected_mode)}")
             continue
+        next_subagents_state = _parse_subagents_command(
+            user_text,
+            _session_subagents_enabled(active_session),
+        )
+        if next_subagents_state is not None:
+            _set_session_subagents_enabled(active_session, next_subagents_state)
+            sessions = _sync_session_state(
+                sessions_index_path=sessions_index_path,
+                sessions=sessions,
+                active_session=active_session,
+                active_session_path=active_session_path,
+                conversation=conversation,
+            )
+            emit(f"当前分工已切换为：{_subagents_enabled_label(next_subagents_state)}")
+            continue
         if user_text in {"/reset", "reset"}:
             finalize_current_session()
             conversation.clear()
@@ -1448,6 +1753,10 @@ def run_chat_session(
             conversation = _load_conversation(active_session_path) if existing_session else []
             active_session_persisted = existing_session
             _set_session_access_mode(active_session, _session_access_mode(active_session))
+            _set_session_subagents_enabled(
+                active_session,
+                _session_subagents_enabled(active_session),
+            )
             session_memory = (
                 _load_session_memory(workspace_root, str(active_session["id"]))
                 if existing_session
@@ -1466,16 +1775,18 @@ def run_chat_session(
             _save_sessions_index(sessions_index_path, sessions)
 
         conversation.append({"role": "user", "content": user_text})
-        write_changes: list[dict[str, Any]] = []
+        write_changes = []
 
         try:
-            _run_conversation(
-                conversation,
+            _run_task_with_optional_subagents(
+                task=user_text,
+                conversation=conversation,
                 workspace_root=workspace_root,
                 client=client,
                 settings=settings,
                 session_memory=session_memory,
                 access_mode=_session_access_mode(active_session),
+                subagents_enabled=_session_subagents_enabled(active_session),
                 write_changes=write_changes,
                 logger=logger,
             )

@@ -74,6 +74,27 @@ def _incremental_memory_response() -> SimpleNamespace:
     )
 
 
+def _review_response(
+    *,
+    summary: str,
+    issues: list[str],
+    needs_retry: bool,
+    retry_advice: str,
+) -> SimpleNamespace:
+    return _message_response(
+        json.dumps(
+            {
+                "summary": summary,
+                "issues": issues,
+                "needs_retry": needs_retry,
+                "retry_advice": retry_advice,
+            },
+            ensure_ascii=False,
+        ),
+        id_suffix="review",
+    )
+
+
 class SequencedResponses:
     def __init__(self, responses: list[SimpleNamespace]) -> None:
         self.responses = responses
@@ -586,3 +607,102 @@ def test_run_agent_read_only_blocks_write_tool(tmp_path: Path) -> None:
     assert "write_file" not in {tool["name"] for tool in calls[0]["tools"]}
     assert calls[1]["input"][-1]["type"] == "function_call_output"
     assert not (tmp_path / "blocked.txt").exists()
+
+
+def test_run_agent_with_subagents_plans_reviews_and_retries(tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            index = len(calls)
+            if index == 1:
+                return _message_response("先检查依赖再写文件", id_suffix="plan")
+            if index == 2:
+                return SimpleNamespace(
+                    id="resp-2",
+                    output=[
+                        SimpleNamespace(
+                            type="function_call",
+                            name="write_file",
+                            arguments=json.dumps(
+                                {"relative_path": "hello.txt", "content": "draft"}
+                            ),
+                            call_id="call-1",
+                        )
+                    ],
+                    output_text="",
+                )
+            if index == 3:
+                return _message_response("draft done", id_suffix="draft")
+            if index == 4:
+                return _review_response(
+                    summary="需要补一个更完整的结果",
+                    issues=["输出太短"],
+                    needs_retry=True,
+                    retry_advice="请补全说明并保持文件内容更明确。",
+                )
+            return _message_response("fixed result", id_suffix="final")
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = FakeResponses()
+
+    logs: list[str] = []
+    result = run_agent(
+        "create file",
+        workspace_root=tmp_path,
+        client=FakeClient(),
+        settings=Settings(api_key="key", model="deepseek-test", max_steps=3),
+        access_mode=ACCESS_WRITE,
+        subagents_enabled=True,
+        logger=logs.append,
+    )
+
+    assert result == "fixed result"
+    assert calls[0]["tools"] == []
+    assert "规划建议：" in calls[2]["instructions"]
+    assert "hello.txt" in calls[3]["input"][0]["content"]
+    assert (tmp_path / "hello.txt").read_text(encoding="utf-8") == "draft"
+    assert any(line.startswith("规划：") for line in logs)
+    assert any(line.startswith("审查：") for line in logs)
+    assert any(line.startswith("审查建议重试：") for line in logs)
+
+
+def test_run_chat_session_can_toggle_subagents(tmp_path: Path) -> None:
+    responses = SequencedResponses(
+        [
+            _message_response("先排个计划", id_suffix="plan"),
+            _message_response("done", id_suffix="exec"),
+            _review_response(
+                summary="结果可接受",
+                issues=[],
+                needs_retry=False,
+                retry_advice="",
+            ),
+            _summary_response(),
+            _global_memory_response(),
+        ]
+    )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = responses
+
+    inputs = iter(["/subagents", "make something", "/exit"])
+    logs: list[str] = []
+
+    run_chat_session(
+        workspace_root=tmp_path,
+        client=FakeClient(),
+        settings=Settings(api_key="key", model="deepseek-test", max_steps=3),
+        logger=logs.append,
+        input_fn=lambda _: next(inputs),
+    )
+
+    sessions = json.loads((tmp_path / ".nju_agent" / "sessions.json").read_text(encoding="utf-8"))
+    assert sessions[0]["subagents_enabled"] is True
+    assert any(line == "当前分工已切换为：开启" for line in logs)
+    assert any(line.startswith("规划：") for line in logs)
+    assert any(line.startswith("审查：") for line in logs)
+    assert logs[-1] == "最终结果：done"
