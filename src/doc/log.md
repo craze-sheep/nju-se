@@ -171,3 +171,19 @@ python -m compileall 1.0/src/nju_agent
 - 更新 `1.0/src/nju_agent/llm.py`。
 - 更新 `1.0/src/nju_agent/agent.py`。
 - 更新测试文件。
+
+### 会话级权限控制
+
+目标：
+
+- 默认只读。
+- 只有切到可写时，才允许写文件和执行命令。
+- 让权限和会话绑定，避免影响其他会话。
+
+已完成：
+
+- 为会话增加 `access_mode`。
+- 新增 `/access` 切换权限。
+- 只读时只暴露 `list_files` / `read_file`。
+- 只读时对 `write_file` / `run_command` 做执行期拦截。
+- 更新相关测试。

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
+import os
+import subprocess
+import sys
 import time
 from datetime import datetime
 from functools import lru_cache
@@ -19,6 +23,9 @@ SYSTEM_PROMPT = """You are a coding agent.
 Use the available tools to complete the user's task.
 Keep file operations inside the workspace root.
 When you finish, answer briefly in Chinese."""
+
+ACCESS_READ_ONLY = "read_only"
+ACCESS_WRITE = "write"
 
 SESSION_SUMMARY_PROMPT = """你是一个会话摘要器。请根据下面的完整对话，提炼出简短、结构化、可用于后续记忆更新的摘要。
 
@@ -88,8 +95,23 @@ GLOBAL_MEMORY_MERGE_PROMPT = """你是一个全局记忆合并器。请把“现
 ```"""
 
 
-def tool_definitions() -> list[dict[str, Any]]:
-    return [
+def _normalize_access_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    if mode in {ACCESS_READ_ONLY, "readonly", "read-only", "read"}:
+        return ACCESS_READ_ONLY
+    return ACCESS_WRITE
+
+
+def _access_mode_label(access_mode: str) -> str:
+    return "只读" if _normalize_access_mode(access_mode) == ACCESS_READ_ONLY else "可写"
+
+
+def _can_use_write_tools(access_mode: str) -> bool:
+    return _normalize_access_mode(access_mode) == ACCESS_WRITE
+
+
+def tool_definitions(access_mode: str = ACCESS_READ_ONLY) -> list[dict[str, Any]]:
+    tools = [
         {
             "type": "function",
             "name": "list_files",
@@ -118,51 +140,56 @@ def tool_definitions() -> list[dict[str, Any]]:
             },
             "strict": True,
         },
-        {
-            "type": "function",
-            "name": "write_file",
-            "description": "在工作区内创建或覆盖一个文本文件。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "relative_path": {
-                        "type": "string",
-                        "description": "相对于工作区根目录的路径。",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "要写入文件的完整文本内容。",
-                    },
-                },
-                "required": ["relative_path", "content"],
-                "additionalProperties": False,
-            },
-            "strict": True,
-        },
-        {
-            "type": "function",
-            "name": "run_command",
-            "description": "在工作区根目录下执行一个命令并返回输出。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "要执行的命令及其参数。",
-                    },
-                    "timeout": {
-                        "type": "number",
-                        "description": "超时时间，单位秒。",
-                    },
-                },
-                "required": ["command"],
-                "additionalProperties": False,
-            },
-            "strict": True,
-        },
     ]
-
+    if _can_use_write_tools(access_mode):
+        tools.extend(
+            [
+                {
+                    "type": "function",
+                    "name": "write_file",
+                    "description": "在工作区内创建或覆盖一个文本文件。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "relative_path": {
+                                "type": "string",
+                                "description": "相对于工作区根目录的路径。",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "要写入文件的完整文本内容。",
+                            },
+                        },
+                        "required": ["relative_path", "content"],
+                        "additionalProperties": False,
+                    },
+                    "strict": True,
+                },
+                {
+                    "type": "function",
+                    "name": "run_command",
+                    "description": "在工作区根目录下执行一个命令并返回输出。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "要执行的命令及其参数。",
+                            },
+                            "timeout": {
+                                "type": "number",
+                                "description": "超时时间，单位秒。",
+                            },
+                        },
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                    "strict": True,
+                },
+            ]
+        )
+    return tools
 
 def _format_tool_result(name: str, result: Any) -> str:
     if isinstance(result, str):
@@ -192,6 +219,14 @@ def _session_memory_file(workspace_root: Path, session_id: str) -> Path:
 
 def _global_memory_file(workspace_root: Path) -> Path:
     return workspace_root / ".nju_agent" / "global_memory.md"
+
+
+def _finalizer_snapshot_dir(workspace_root: Path) -> Path:
+    return workspace_root / ".nju_agent" / "finalizer_snapshots"
+
+
+def _finalizer_snapshot_file(workspace_root: Path, session_id: str) -> Path:
+    return _finalizer_snapshot_dir(workspace_root) / f"{session_id}.json"
 
 
 def _write_batches_dir(workspace_root: Path) -> Path:
@@ -264,6 +299,82 @@ def _load_json_file(path: Path, default: Any) -> Any:
 def _save_json_file(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _save_finalizer_snapshot(
+    workspace_root: Path,
+    session_snapshot: dict[str, Any],
+    conversation_snapshot: list[dict[str, Any]],
+    keep_empty: bool,
+) -> Path:
+    snapshot = {
+        "workspace_root": str(workspace_root),
+        "session_snapshot": session_snapshot,
+        "conversation_snapshot": conversation_snapshot,
+        "keep_empty": keep_empty,
+    }
+    path = _finalizer_snapshot_file(workspace_root, str(session_snapshot["id"]))
+    _save_json_file(path, snapshot)
+    return path
+
+
+def _load_finalizer_snapshot(path: Path) -> dict[str, Any]:
+    raw = _load_text_file(path)
+    if not raw:
+        raise RuntimeError("finalizer snapshot is empty")
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise RuntimeError("finalizer snapshot must be a JSON object")
+    return data
+
+
+def _finalize_snapshot_file(snapshot_path: Path) -> None:
+    data = _load_finalizer_snapshot(snapshot_path)
+    workspace_root = Path(str(data.get("workspace_root", ""))).resolve()
+    session_snapshot = data.get("session_snapshot", {})
+    conversation_snapshot = data.get("conversation_snapshot", [])
+    keep_empty = bool(data.get("keep_empty", False))
+
+    if not isinstance(session_snapshot, dict):
+        raise RuntimeError("finalizer snapshot session data is invalid")
+    if not isinstance(conversation_snapshot, list):
+        raise RuntimeError("finalizer snapshot conversation data is invalid")
+
+    session_id = str(session_snapshot.get("id", "")).strip()
+    if not session_id:
+        raise RuntimeError("finalizer snapshot session id is missing")
+
+    settings = load_settings()
+    client = build_client(settings)
+    _sync_session_state(
+        sessions_index_path=_sessions_index_file(workspace_root),
+        sessions=_load_sessions_index(_sessions_index_file(workspace_root)),
+        active_session=session_snapshot,
+        active_session_path=_session_path(workspace_root, session_id),
+        conversation=conversation_snapshot,
+        keep_empty=keep_empty,
+    )
+    _finalize_session_memory(
+        workspace_root=workspace_root,
+        session_id=session_id,
+        conversation=conversation_snapshot,
+        client=client,
+        settings=settings,
+    )
+
+
+def _spawn_detached_finalizer(snapshot_path: Path) -> subprocess.Popen[Any]:
+    data = _load_finalizer_snapshot(snapshot_path)
+    workspace_root = Path(str(data.get("workspace_root", ""))).resolve()
+    return subprocess.Popen(
+        [sys.executable, "-m", "nju_agent", "--finalize-snapshot", str(snapshot_path)],
+        cwd=str(workspace_root),
+        env=os.environ.copy(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 def _load_write_batches(workspace_root: Path, session_id: str) -> list[dict[str, Any]]:
@@ -540,11 +651,13 @@ def _build_instructions(
     *,
     workspace_root: Path,
     session_memory: dict[str, Any],
+    access_mode: str,
 ) -> str:
     global_memory = _global_memory_markdown(workspace_root)
     session_memory_text = _session_memory_markdown(session_memory)
     return (
         f"{SYSTEM_PROMPT}\n\n"
+        f"当前会话权限：{_access_mode_label(access_mode)}\n\n"
         f"全局记忆：\n{global_memory}\n\n"
         f"会话记忆：\n{session_memory_text}"
     )
@@ -556,10 +669,12 @@ def _fit_visible_conversation(
     workspace_root: Path,
     settings: Settings,
     session_memory: dict[str, Any],
+    access_mode: str,
 ) -> tuple[list[dict[str, Any]], int]:
     instructions = _build_instructions(
         workspace_root=workspace_root,
         session_memory=session_memory,
+        access_mode=access_mode,
     )
     max_turns = min(settings.recent_turns, len(
         [item for item in conversation if str(item.get("role", "")).strip() == "user"]
@@ -571,7 +686,7 @@ def _fit_visible_conversation(
         token_count = _count_payload_tokens(
             instructions=instructions,
             conversation=visible,
-            tools=tool_definitions(),
+            tools=tool_definitions(access_mode),
             model=settings.model,
         )
         if token_count <= settings.context_token_limit or turns == 1:
@@ -580,7 +695,7 @@ def _fit_visible_conversation(
     return list(conversation), _count_payload_tokens(
         instructions=instructions,
         conversation=conversation,
-        tools=tool_definitions(),
+        tools=tool_definitions(access_mode),
         model=settings.model,
     )
 
@@ -789,6 +904,7 @@ def _create_session_record(title: str = "新会话") -> dict[str, Any]:
         "updated_at": now,
         "message_count": 0,
         "memory_compacted_upto": 0,
+        "access_mode": ACCESS_READ_ONLY,
     }
 
 
@@ -817,6 +933,27 @@ def _choose_session(
             index = int(choice) - 1
             if 0 <= index < len(sessions):
                 return sessions[index]
+        emit("输入无效，请重新选择")
+
+
+def _choose_access_mode(
+    input_fn: Callable[[str], str],
+    logger: Callable[[str], None],
+) -> str | None:
+    emit = logger or (lambda _: None)
+    emit("权限选项：")
+    emit("1. 只读")
+    emit("2. 可写")
+    emit("b. 返回")
+
+    while True:
+        choice = input_fn("选择权限编号，或输入 b 返回：").strip().lower()
+        if choice in {"b", "back"}:
+            return None
+        if choice == "1":
+            return ACCESS_READ_ONLY
+        if choice == "2":
+            return ACCESS_WRITE
         emit("输入无效，请重新选择")
 
 
@@ -876,6 +1013,14 @@ def _should_title_from_first_message(session: dict[str, Any]) -> bool:
     return message_count == 0 and title.startswith("新会话")
 
 
+def _session_access_mode(session: dict[str, Any]) -> str:
+    return _normalize_access_mode(session.get("access_mode", ACCESS_READ_ONLY))
+
+
+def _set_session_access_mode(session: dict[str, Any], access_mode: str) -> None:
+    session["access_mode"] = _normalize_access_mode(access_mode)
+
+
 def _response_item_to_history(item: Any) -> dict[str, Any] | None:
     item_type = getattr(item, "type", None)
 
@@ -902,6 +1047,7 @@ def _call_tool(
     name: str,
     arguments: dict[str, Any],
     workspace_root: Path,
+    access_mode: str,
     write_changes: list[dict[str, Any]] | None = None,
 ) -> str:
     root = str(workspace_root)
@@ -912,6 +1058,8 @@ def _call_tool(
         if name == "read_file":
             return read_file(root, arguments["relative_path"])
         if name == "write_file":
+            if not _can_use_write_tools(access_mode):
+                return "错误：当前会话是只读权限，不能使用 write_file"
             result = write_file(root, arguments["relative_path"], arguments["content"])
             change = {
                 "relative_path": result.relative_path,
@@ -930,6 +1078,8 @@ def _call_tool(
                 },
             )
         if name == "run_command":
+            if not _can_use_write_tools(access_mode):
+                return "错误：当前会话是只读权限，不能使用 run_command"
             result = run_command(
                 root,
                 arguments["command"],
@@ -955,6 +1105,7 @@ def _run_conversation(
     client: Any | None = None,
     settings: Settings | None = None,
     session_memory: dict[str, Any] | None = None,
+    access_mode: str = ACCESS_WRITE,
     write_changes: list[dict[str, Any]] | None = None,
     logger: Callable[[str], None] | None = print,
 ) -> str:
@@ -972,15 +1123,17 @@ def _run_conversation(
             workspace_root=workspace_root,
             settings=settings,
             session_memory=session_memory,
+            access_mode=access_mode,
         )
         response = request_response(
             client,
             model=settings.model,
             input=visible_conversation,
-            tools=tool_definitions(),
+            tools=tool_definitions(access_mode),
             instructions=_build_instructions(
                 workspace_root=workspace_root,
                 session_memory=session_memory,
+                access_mode=access_mode,
             ),
         )
 
@@ -1018,6 +1171,7 @@ def _run_conversation(
                 item.name,
                 arguments,
                 workspace_root,
+                access_mode=access_mode,
                 write_changes=write_changes,
             )
             conversation.append(
@@ -1064,6 +1218,7 @@ def run_agent(
     workspace_root: Path,
     client: Any | None = None,
     settings: Settings | None = None,
+    access_mode: str = ACCESS_READ_ONLY,
     logger: Callable[[str], None] | None = print,
 ) -> str:
     conversation: list[dict[str, Any]] = [{"role": "user", "content": task}]
@@ -1072,6 +1227,7 @@ def run_agent(
         workspace_root=workspace_root,
         client=client,
         settings=settings,
+        access_mode=access_mode,
         logger=logger,
     )
 
@@ -1083,6 +1239,7 @@ def run_chat_session(
     settings: Settings | None = None,
     logger: Callable[[str], None] | None = print,
     input_fn: Callable[[str], str] = input,
+    background_finalize: bool = False,
 ) -> None:
     settings = settings or load_settings()
     client = client or build_client(settings)
@@ -1091,6 +1248,7 @@ def run_chat_session(
     sessions_index_path = _sessions_index_file(workspace_root)
     sessions = _load_sessions_index(sessions_index_path)
     legacy_conversation_path = _conversation_file(workspace_root)
+    exit_requested = False
 
     if not sessions and legacy_conversation_path.exists():
         conversation = _load_conversation(legacy_conversation_path)
@@ -1102,33 +1260,67 @@ def run_chat_session(
             _save_sessions_index(sessions_index_path, sessions)
             _clear_conversation(legacy_conversation_path)
 
-    emit("进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/diff 查看差异，/undo 撤销写入")
+    emit("进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/access 切换权限，/diff 查看差异，/undo 撤销写入")
 
     active_session = _create_session_record()
     active_session_path = _session_path(workspace_root, str(active_session["id"]))
     conversation: list[dict[str, Any]] = []
     session_memory = _default_session_memory()
     active_session_persisted = False
+    pending_finalizers: dict[str, Any] = {}
+    emit(f"当前权限：{_access_mode_label(_session_access_mode(active_session))}，输入 /access 切换")
+
+    def _wait_for_finalizer(session_id: str) -> None:
+        thread = pending_finalizers.get(session_id)
+        if thread is None:
+            return
+        wait = getattr(thread, "wait", None)
+        if callable(wait):
+            wait()
+        else:
+            thread.join()
+        pending_finalizers.pop(session_id, None)
+
+    def _wait_for_all_finalizers() -> None:
+        for session_id in list(pending_finalizers.keys()):
+            _wait_for_finalizer(session_id)
+
+    def _finalize_snapshot(
+        *,
+        session_snapshot: dict[str, Any],
+        conversation_snapshot: list[dict[str, Any]],
+        keep_empty: bool,
+    ) -> dict[str, Any]:
+        if not conversation_snapshot:
+            return _load_session_memory(workspace_root, str(session_snapshot["id"]))
+        session_path = _session_path(workspace_root, str(session_snapshot["id"]))
+        _sync_session_state(
+            sessions_index_path=sessions_index_path,
+            sessions=_load_sessions_index(sessions_index_path),
+            active_session=session_snapshot,
+            active_session_path=session_path,
+            conversation=conversation_snapshot,
+            keep_empty=keep_empty,
+        )
+        return _finalize_session_memory(
+            workspace_root=workspace_root,
+            session_id=str(session_snapshot["id"]),
+            conversation=conversation_snapshot,
+            client=client,
+            settings=settings,
+        )
 
     def finalize_current_session() -> None:
         nonlocal sessions, session_memory, active_session_persisted
         if not conversation:
             return
-        sessions = _sync_session_state(
-            sessions_index_path=sessions_index_path,
-            sessions=sessions,
-            active_session=active_session,
-            active_session_path=active_session_path,
-            conversation=conversation,
+        _wait_for_finalizer(str(active_session["id"]))
+        session_memory = _finalize_snapshot(
+            session_snapshot=active_session,
+            conversation_snapshot=conversation,
             keep_empty=active_session_persisted,
         )
-        session_memory = _finalize_session_memory(
-            workspace_root=workspace_root,
-            session_id=str(active_session["id"]),
-            conversation=conversation,
-            client=client,
-            settings=settings,
-        )
+        sessions = _load_sessions_index(sessions_index_path)
         active_session_persisted = True
 
     def maybe_compact_session_memory() -> None:
@@ -1161,13 +1353,44 @@ def run_chat_session(
             continue
         maybe_compact_session_memory()
         if user_text in {"/exit", "exit", "quit", "/quit"}:
-            finalize_current_session()
+            if background_finalize and conversation:
+                _sync_session_state(
+                    sessions_index_path=sessions_index_path,
+                    sessions=sessions,
+                    active_session=active_session,
+                    active_session_path=active_session_path,
+                    conversation=conversation,
+                )
+                snapshot_path = _save_finalizer_snapshot(
+                    workspace_root,
+                    deepcopy(active_session),
+                    deepcopy(conversation),
+                    active_session_persisted,
+                )
+                _spawn_detached_finalizer(snapshot_path)
+                exit_requested = True
+            else:
+                finalize_current_session()
             break
         if user_text in {"/diff", "diff"}:
             emit(_last_write_diff(workspace_root, str(active_session["id"])))
             continue
         if user_text in {"/undo", "undo"}:
             emit(_undo_last_write_batch(workspace_root, str(active_session["id"])))
+            continue
+        if user_text in {"/access", "access", "/perm", "perm", "/mode", "mode"}:
+            selected_mode = _choose_access_mode(input_fn, emit)
+            if selected_mode is None:
+                continue
+            _set_session_access_mode(active_session, selected_mode)
+            sessions = _sync_session_state(
+                sessions_index_path=sessions_index_path,
+                sessions=sessions,
+                active_session=active_session,
+                active_session_path=active_session_path,
+                conversation=conversation,
+            )
+            emit(f"当前权限已切换为：{_access_mode_label(selected_mode)}")
             continue
         if user_text in {"/reset", "reset"}:
             finalize_current_session()
@@ -1193,7 +1416,6 @@ def run_chat_session(
             active_session_persisted = False
             continue
         if user_text in {"/choose", "choose", "/switch", "switch"}:
-            finalize_current_session()
             selected_session = _choose_session(sessions, input_fn, emit)
             if selected_session is None:
                 continue
@@ -1201,10 +1423,31 @@ def run_chat_session(
                 session.get("id") == selected_session.get("id")
                 for session in sessions
             )
+            selected_session_id = str(selected_session.get("id", ""))
+            if conversation and selected_session_id != str(active_session.get("id", "")):
+                session_snapshot = deepcopy(active_session)
+                conversation_snapshot = deepcopy(conversation)
+                keep_empty_snapshot = active_session_persisted
+                session_id_snapshot = str(session_snapshot["id"])
+
+                thread = pending_finalizers.get(session_id_snapshot)
+                if thread is None:
+                    snapshot_path = _save_finalizer_snapshot(
+                        workspace_root,
+                        session_snapshot,
+                        conversation_snapshot,
+                        keep_empty_snapshot,
+                    )
+                    pending_finalizers[session_id_snapshot] = _spawn_detached_finalizer(
+                        snapshot_path
+                    )
+            if selected_session_id:
+                _wait_for_finalizer(selected_session_id)
             active_session = selected_session
             active_session_path = _session_path(workspace_root, str(active_session["id"]))
             conversation = _load_conversation(active_session_path) if existing_session else []
             active_session_persisted = existing_session
+            _set_session_access_mode(active_session, _session_access_mode(active_session))
             session_memory = (
                 _load_session_memory(workspace_root, str(active_session["id"]))
                 if existing_session
@@ -1213,6 +1456,7 @@ def run_chat_session(
             if existing_session:
                 active_session["message_count"] = len(conversation)
                 _print_conversation_history(conversation, emit)
+            emit(f"当前权限：{_access_mode_label(_session_access_mode(active_session))}，输入 /access 切换")
             continue
 
         if _should_title_from_first_message(active_session):
@@ -1231,6 +1475,7 @@ def run_chat_session(
                 client=client,
                 settings=settings,
                 session_memory=session_memory,
+                access_mode=_session_access_mode(active_session),
                 write_changes=write_changes,
                 logger=logger,
             )
@@ -1251,3 +1496,6 @@ def run_chat_session(
             conversation=conversation,
         )
         active_session_persisted = True
+
+    if not exit_requested:
+        _wait_for_all_finalizers()

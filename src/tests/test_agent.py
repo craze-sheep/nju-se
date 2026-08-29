@@ -5,10 +5,13 @@ from types import SimpleNamespace
 
 import nju_agent.__main__ as main_module
 from nju_agent.agent import (
+    ACCESS_READ_ONLY,
+    ACCESS_WRITE,
     _compact_session_memory_if_needed,
     _visible_conversation,
     run_agent,
     run_chat_session,
+    tool_definitions,
 )
 from nju_agent.config import Settings
 
@@ -167,6 +170,7 @@ def test_run_agent_handles_tool_call_then_completion(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         client=FakeClient(),
         settings=Settings(api_key="key", model="deepseek-test", max_steps=3),
+        access_mode=ACCESS_WRITE,
         logger=logs.append,
     )
 
@@ -201,9 +205,10 @@ def test_main_uses_settings_and_chat_session(monkeypatch) -> None:
     def fake_load_settings():
         return Settings(api_key="key", model="deepseek-test", max_steps=1)
 
-    def fake_run_chat_session(*, workspace_root, settings, client=None, logger=None, input_fn=None):
+    def fake_run_chat_session(*, workspace_root, settings, client=None, logger=None, input_fn=None, background_finalize=False):
         captured["workspace_root"] = workspace_root
         captured["settings"] = settings
+        captured["background_finalize"] = background_finalize
         return None
 
     monkeypatch.setattr(main_module, "load_settings", fake_load_settings)
@@ -211,6 +216,7 @@ def test_main_uses_settings_and_chat_session(monkeypatch) -> None:
 
     assert main_module.main([]) == 0
     assert captured["workspace_root"] == Path.cwd()
+    assert captured["background_finalize"] is True
 
 
 def test_run_chat_session_keeps_conversation_history(tmp_path: Path) -> None:
@@ -241,8 +247,9 @@ def test_run_chat_session_keeps_conversation_history(tmp_path: Path) -> None:
     assert responses.calls[0]["input"][0]["content"] == "first task"
     assert any(item.get("content") == "second task" for item in responses.calls[1]["input"])
     assert any(item.get("content") == "done-1" for item in responses.calls[1]["input"])
-    assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/diff 查看差异，/undo 撤销写入"
-    assert logs[1:] == ["最终结果：done-1", "最终结果：done-2"]
+    assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/access 切换权限，/diff 查看差异，/undo 撤销写入"
+    assert logs[1] == "当前权限：只读，输入 /access 切换"
+    assert logs[2:] == ["最终结果：done-1", "最终结果：done-2"]
     sessions = json.loads((tmp_path / ".nju_agent" / "sessions.json").read_text(encoding="utf-8"))
     assert len(sessions) == 1
     assert sessions[0]["message_count"] == 4
@@ -283,7 +290,7 @@ def test_run_chat_session_undo_reverts_last_write_batch(tmp_path: Path) -> None:
     (tmp_path / "hello.txt").write_text("old content", encoding="utf-8")
     subprocess.run(["git", "add", "hello.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
     subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
-    inputs = iter(["make change", "/undo", "/exit"])
+    inputs = iter(["/access", "2", "make change", "/undo", "/exit"])
 
     run_chat_session(
         workspace_root=tmp_path,
@@ -344,8 +351,9 @@ def test_run_chat_session_starts_new_session_by_default(tmp_path: Path) -> None:
 
     assert all(item.get("content") != "old" for item in responses.calls[0]["input"])
     assert any(item.get("content") == "new task" for item in responses.calls[0]["input"])
-    assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/diff 查看差异，/undo 撤销写入"
-    assert logs[1] == "最终结果：done"
+    assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/access 切换权限，/diff 查看差异，/undo 撤销写入"
+    assert logs[1] == "当前权限：只读，输入 /access 切换"
+    assert logs[2] == "最终结果：done"
 
 
 def test_run_chat_session_choose_loads_saved_history(tmp_path: Path) -> None:
@@ -395,7 +403,8 @@ def test_run_chat_session_choose_loads_saved_history(tmp_path: Path) -> None:
     assert any(line == "1. 旧会话" for line in logs)
     assert any(line == "历史消息：" for line in logs)
     assert any(line == "你：old" for line in logs)
-    assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/diff 查看差异，/undo 撤销写入"
+    assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/access 切换权限，/diff 查看差异，/undo 撤销写入"
+    assert logs[1] == "当前权限：只读，输入 /access 切换"
     assert logs[-1] == "最终结果：done"
 
 
@@ -534,3 +543,46 @@ def test_new_session_title_uses_first_user_message(tmp_path: Path) -> None:
         session["title"] == "帮我看看这个项目里有哪些文件"
         for session in sessions
     )
+
+
+def test_run_agent_read_only_blocks_write_tool(tmp_path: Path) -> None:
+    calls = []
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return SimpleNamespace(
+                    id="resp-1",
+                    output=[
+                        SimpleNamespace(
+                            type="function_call",
+                            name="write_file",
+                            arguments=json.dumps(
+                                {"relative_path": "blocked.txt", "content": "nope"}
+                            ),
+                            call_id="call-1",
+                        )
+                    ],
+                    output_text="",
+                )
+            return SimpleNamespace(id="resp-2", output=[], output_text="done")
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = FakeResponses()
+
+    result = run_agent(
+        "test read only",
+        workspace_root=tmp_path,
+        client=FakeClient(),
+        settings=Settings(api_key="key", model="deepseek-test", max_steps=3),
+        access_mode=ACCESS_READ_ONLY,
+        logger=lambda _: None,
+    )
+
+    assert result == "done"
+    assert {tool["name"] for tool in tool_definitions(ACCESS_READ_ONLY)} == {"list_files", "read_file"}
+    assert "write_file" not in {tool["name"] for tool in calls[0]["tools"]}
+    assert calls[1]["input"][-1]["type"] == "function_call_output"
+    assert not (tmp_path / "blocked.txt").exists()
