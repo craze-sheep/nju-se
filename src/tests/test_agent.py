@@ -1,9 +1,14 @@
 import json
+import builtins
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
+from rich.console import Console
+
 import nju_agent.__main__ as main_module
+import nju_agent.agent as agent_module
 from nju_agent.agent import (
     ACCESS_READ_ONLY,
     ACCESS_WRITE,
@@ -14,6 +19,7 @@ from nju_agent.agent import (
     tool_definitions,
 )
 from nju_agent.config import Settings
+from nju_agent.ui import TerminalUI
 
 
 def _message_response(text: str, *, id_suffix: str = "msg") -> SimpleNamespace:
@@ -268,9 +274,7 @@ def test_run_chat_session_keeps_conversation_history(tmp_path: Path) -> None:
     assert responses.calls[0]["input"][0]["content"] == "first task"
     assert any(item.get("content") == "second task" for item in responses.calls[1]["input"])
     assert any(item.get("content") == "done-1" for item in responses.calls[1]["input"])
-    assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/access 切换权限，/diff 查看差异，/undo 撤销写入"
-    assert logs[1] == "当前权限：只读，输入 /access 切换"
-    assert logs[2:] == ["最终结果：done-1", "最终结果：done-2"]
+    assert logs == ["最终结果：done-1", "最终结果：done-2"]
     sessions = json.loads((tmp_path / ".nju_agent" / "sessions.json").read_text(encoding="utf-8"))
     assert len(sessions) == 1
     assert sessions[0]["message_count"] == 4
@@ -372,9 +376,7 @@ def test_run_chat_session_starts_new_session_by_default(tmp_path: Path) -> None:
 
     assert all(item.get("content") != "old" for item in responses.calls[0]["input"])
     assert any(item.get("content") == "new task" for item in responses.calls[0]["input"])
-    assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/access 切换权限，/diff 查看差异，/undo 撤销写入"
-    assert logs[1] == "当前权限：只读，输入 /access 切换"
-    assert logs[2] == "最终结果：done"
+    assert logs == ["最终结果：done"]
 
 
 def test_run_chat_session_choose_loads_saved_history(tmp_path: Path) -> None:
@@ -422,10 +424,6 @@ def test_run_chat_session_choose_loads_saved_history(tmp_path: Path) -> None:
     assert any(item.get("content") == "new task" for item in responses.calls[0]["input"])
     assert any(line == "可用会话：" for line in logs)
     assert any(line == "1. 旧会话" for line in logs)
-    assert any(line == "历史消息：" for line in logs)
-    assert any(line == "你：old" for line in logs)
-    assert logs[0] == "进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/access 切换权限，/diff 查看差异，/undo 撤销写入"
-    assert logs[1] == "当前权限：只读，输入 /access 切换"
     assert logs[-1] == "最终结果：done"
 
 
@@ -472,7 +470,7 @@ def test_run_chat_session_choose_back_returns_to_current_session(tmp_path: Path)
 
     assert all(item.get("content") != "old" for item in responses.calls[0]["input"])
     assert any(item.get("content") == "new task" for item in responses.calls[0]["input"])
-    assert any(line == "b. 返回" for line in logs)
+    assert all(line != "b. 返回" for line in logs)
 
 
 def test_run_chat_session_reset_clears_history(tmp_path: Path) -> None:
@@ -706,3 +704,123 @@ def test_run_chat_session_can_toggle_subagents(tmp_path: Path) -> None:
     assert any(line.startswith("规划：") for line in logs)
     assert any(line.startswith("审查：") for line in logs)
     assert logs[-1] == "最终结果：done"
+
+
+def test_run_chat_session_rejects_unknown_slash_command_before_model(tmp_path: Path) -> None:
+    responses = SequencedResponses(
+        [
+            _summary_response(),
+            _global_memory_response(),
+        ]
+    )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = responses
+
+    inputs = iter(["/subagent", "/exit"])
+    logs: list[str] = []
+
+    run_chat_session(
+        workspace_root=tmp_path,
+        client=FakeClient(),
+        settings=Settings(api_key="key", model="deepseek-test", max_steps=3),
+        logger=logs.append,
+        input_fn=lambda _: next(inputs),
+    )
+
+    assert logs == ["错误：没有这个功能：/subagent"]
+    assert len(responses.calls) == 0
+
+
+def test_run_chat_session_default_terminal_ui_emits_final_result(monkeypatch, tmp_path: Path) -> None:
+    responses = SequencedResponses(
+        [
+            _empty_response("done"),
+            _summary_response(),
+            _global_memory_response(),
+        ]
+    )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = responses
+
+    class FakeUI:
+        def __init__(self) -> None:
+            self.outputs: list[str] = []
+            self.inputs = iter(["check model", "/exit"])
+
+        def banner(self, **kwargs) -> None:
+            self.outputs.append("banner")
+
+        def render_state(self, **kwargs) -> None:
+            self.outputs.append(f"state:{kwargs['access_mode']}:{kwargs['subagents_enabled']}")
+
+        def emit(self, message: str) -> None:
+            self.outputs.append(message)
+
+        def input(self, prompt: str) -> str:
+            self.outputs.append(prompt)
+            return next(self.inputs)
+
+        def status(self, message: str, spinner: str = "dots"):
+            self.outputs.append(message)
+            return nullcontext()
+
+    fake_ui = FakeUI()
+    same_input = lambda prompt="": "unused"
+    monkeypatch.setattr(builtins, "input", same_input)
+    monkeypatch.setattr(agent_module, "create_terminal_ui", lambda: fake_ui)
+    monkeypatch.setattr(agent_module.run_chat_session, "__kwdefaults__", {
+        **agent_module.run_chat_session.__kwdefaults__,
+        "input_fn": same_input,
+    })
+
+    run_chat_session(
+        workspace_root=tmp_path,
+        client=FakeClient(),
+        settings=Settings(api_key="key", model="deepseek-test", max_steps=3),
+        logger=None,
+    )
+
+    assert any(message.startswith("最终结果：") for message in fake_ui.outputs)
+    assert any(message == "最终结果：done" for message in fake_ui.outputs)
+    assert any(message.startswith("state:") for message in fake_ui.outputs)
+
+
+def test_terminal_ui_pretty_prints_json_tool_result() -> None:
+    console = Console(record=True, width=80)
+    ui = TerminalUI(console=console)
+
+    ui.emit('工具结果：[".git", ".nju_agent", "README.txt", "src"]')
+
+    text = console.export_text(clear=False)
+    assert ".git" in text
+    assert "'src'" in text
+    assert text.count("\n") >= 4
+
+
+def test_terminal_ui_banner_keeps_logo_compact() -> None:
+    console = Console(record=True, width=100)
+    ui = TerminalUI(console=console)
+
+    ui.banner(
+        workspace_root=Path("/home/lzy/project/nju-逮捕在逃offer"),
+        model="deepseek-v4-flash",
+    )
+
+    text = console.export_text(clear=False)
+    assert "Semacode Agent" in text
+    assert max(len(line) for line in text.splitlines()) <= 100
+
+
+def test_terminal_ui_state_is_separate_from_banner() -> None:
+    console = Console(record=True, width=100)
+    ui = TerminalUI(console=console)
+
+    ui.render_state(access_mode="只读", subagents_enabled=False)
+
+    text = console.export_text(clear=False)
+    assert "编辑权限" in text
+    assert "subagents" in text

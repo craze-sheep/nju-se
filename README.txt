@@ -1,14 +1,30 @@
 NJU 推免考核项目：构建编程智能体
 
-当前状态：已实现最小可运行版本，采用本地自写 agent 循环 + DeepSeek 原生 tool calling + 本地工具执行，并支持会话级只读 / 可写权限切换。
-新增可选轻量 subagent 分工：planner 只规划、reviewer 只审查，executor 仍是唯一能使用工具的执行者。
+Semacode Agent（思码智能体）：以语义建模为内核的 coding agent，面向需求理解、代码生成、检索与修复，保持意图一致。
 
-实现口径：
-1. 只使用模型厂商 API 客户端库
-2. 不使用 LangChain、LlamaIndex、AutoGen、CrewAI、OpenAI Agents SDK 等 agent 框架
-3. 不依赖服务端托管的代码执行或文件工具
-4. 工具执行、上下文管理、循环终止和错误处理都在本地完成
-5. 会话默认只读，需要时可用 `/access` 切换到可写
-6. 只读模式只暴露 `list_files` / `read_file`，可写模式才开放 `write_file` / `run_command`
-7. 可用 `/subagents` 打开或关闭 planner/reviewer 分工模式
-8. `run_command` 默认在 Docker 常驻沙箱容器中执行；本地直跑仅作为显式开发模式
+仓库地址：https://github.com/craze-sheep/nju-se.git
+
+这是一个自写的 coding agent。它不依赖现成 agent 框架，而是基于 DeepSeek 原生 tool calling，由程序自己完成对话编排、本地工具执行、上下文管理、记忆维护和循环终止。它可以读取文件、修改文件、执行命令，并持续推进编程任务。
+
+已实现功能：
+- 终端交互式对话：用户直接在命令行输入任务，agent 会一轮一轮地接着处理，带有更清晰的阶段提示与过程展示。
+- 原生 tool calling：模型不直接改文件或跑命令，而是先判断下一步要不要调用工具；真正的执行逻辑由本地程序接管。
+- 本地工具：实现了 `list_files`、`read_file`、`write_file`、`run_command`，分别负责看目录、读文件、写文件和执行命令。
+- 对话管理：程序会保存历史消息，还支持会话切换、最近轮数裁剪和 token 预算控制，避免上下文越来越长、最后装不下。
+- 记忆系统：每个会话结束后都会生成摘要，再合并到全局记忆里，用来保留用户偏好、关键决定和重要文件。
+- 权限控制：默认是只读；用户可以用 `/access` 切到可写。只读时只开放 `list_files` / `read_file`，不会让模型直接修改内容。
+- Git 集成：`write_file` 会记录 diff，用户可以用 `/diff` 看最近一次改了什么，用 `/undo` 撤销最近一批写入。
+- 轻量分工：用户可以用 `/subagents` 打开 planner / reviewer。planner 先把任务拆清楚，reviewer 再检查结果，真正动手的还是 executor。
+- 沙箱执行：`run_command` 默认不直接跑在宿主机上，而是进 Docker 常驻沙箱容器执行，容器禁网、降权、限资源，尽量把危险命令影响缩小。
+- 错误处理：工具失败时不会让整个程序崩掉，而是把错误信息返回给模型继续处理。
+
+这个版本的核心特点是：所有关键逻辑都在本地实现，模型只负责“想下一步做什么”，不负责直接碰文件或执行命令。
+
+运行方式：
+1. 设置环境变量 `DEEPSEEK_API_KEY`
+2. 在仓库根目录执行：`PYTHONPATH=src/src python -m nju_agent`
+3. 运行测试：`PYTHONPATH=src/src pytest src/tests -q`
+
+补充说明：
+- API key 只通过环境变量提供，不写入仓库、README.txt 或视频
+- 如需本地直跑 `run_command`，可设置 `NJU_AGENT_RUN_COMMAND_MODE=local`

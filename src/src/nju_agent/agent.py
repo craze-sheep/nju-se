@@ -8,6 +8,7 @@ import sys
 import time
 from datetime import datetime
 from functools import lru_cache
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -17,6 +18,7 @@ import tiktoken
 from .config import Settings, load_settings
 from .llm import build_client, request_response
 from .tools import list_files, read_file, run_command, revert_write_file, write_file
+from .ui import TerminalUI, create_terminal_ui
 
 
 SYSTEM_PROMPT = """You are a coding agent.
@@ -747,24 +749,28 @@ def _generate_task_plan(
     access_mode: str,
     client: Any,
     settings: Settings,
+    ui: TerminalUI | None = None,
 ) -> str:
-    response = request_response(
-        client,
-        model=settings.model,
-        input=[
-            {
-                "role": "user",
-                "content": _planner_context_text(
-                    task=task,
-                    conversation=conversation,
-                    session_memory=session_memory,
-                    access_mode=access_mode,
-                ),
-            }
-        ],
-        tools=[],
-        instructions=PLANNER_PROMPT,
+    context = _planner_context_text(
+        task=task,
+        conversation=conversation,
+        session_memory=session_memory,
+        access_mode=access_mode,
     )
+    status = ui.status("正在规划任务") if ui is not None else nullcontext()
+    with status:
+        response = request_response(
+            client,
+            model=settings.model,
+            input=[
+                {
+                    "role": "user",
+                    "content": context,
+                }
+            ],
+            tools=[],
+            instructions=PLANNER_PROMPT,
+        )
     return (getattr(response, "output_text", "") or "").strip()
 
 
@@ -806,26 +812,30 @@ def _review_task_result(
     access_mode: str,
     client: Any,
     settings: Settings,
+    ui: TerminalUI | None = None,
 ) -> dict[str, Any]:
-    response = request_response(
-        client,
-        model=settings.model,
-        input=[
-            {
-                "role": "user",
-                "content": _review_context_text(
-                    task=task,
-                    plan=plan,
-                    final_text=final_text,
-                    diff_text=diff_text,
-                    session_memory=session_memory,
-                    access_mode=access_mode,
-                ),
-            }
-        ],
-        tools=[],
-        instructions=REVIEWER_PROMPT,
+    context = _review_context_text(
+        task=task,
+        plan=plan,
+        final_text=final_text,
+        diff_text=diff_text,
+        session_memory=session_memory,
+        access_mode=access_mode,
     )
+    status = ui.status("正在审查结果") if ui is not None else nullcontext()
+    with status:
+        response = request_response(
+            client,
+            model=settings.model,
+            input=[
+                {
+                    "role": "user",
+                    "content": context,
+                }
+            ],
+            tools=[],
+            instructions=REVIEWER_PROMPT,
+        )
     return _parse_reviewer_result((getattr(response, "output_text", "") or "").strip())
 
 
@@ -1037,26 +1047,6 @@ def _session_label(session: dict[str, Any]) -> str:
     return "未命名会话"
 
 
-def _print_conversation_history(
-    conversation: list[dict[str, Any]],
-    logger: Callable[[str], None],
-) -> None:
-    emit = logger or (lambda _: None)
-    if not conversation:
-        return
-
-    emit("历史消息：")
-    for item in conversation:
-        role = str(item.get("role", "")).strip()
-        content = str(item.get("content", "")).strip()
-        if not content:
-            continue
-        if role == "user":
-            emit(f"你：{content}")
-        elif role == "assistant":
-            emit(f"助手：{content}")
-
-
 def _derive_session_title(text: str) -> str:
     text = " ".join(text.split()).strip()
     if not text:
@@ -1083,6 +1073,8 @@ def _choose_session(
     sessions: list[dict[str, Any]],
     input_fn: Callable[[str], str],
     logger: Callable[[str], None],
+    *,
+    prompt_style: bool = False,
 ) -> dict[str, Any] | None:
     emit = logger or (lambda _: None)
     if not sessions:
@@ -1091,11 +1083,14 @@ def _choose_session(
     emit("可用会话：")
     for index, session in enumerate(sessions, start=1):
         emit(f"{index}. {_session_label(session)}")
-    emit("n. 新建会话")
-    emit("b. 返回")
 
     while True:
-        choice = input_fn("选择会话编号，或输入 n 新建，b 返回：").strip().lower()
+        prompt = (
+            "[bold cyan]选择会话编号[/bold cyan]，或输入 [bold]n[/bold] 新建，[bold]b[/bold] 返回："
+            if prompt_style
+            else "选择会话编号，或输入 n 新建，b 返回："
+        )
+        choice = input_fn(prompt).strip().lower()
         if choice in {"b", "back"}:
             return None
         if choice in {"n", "new"}:
@@ -1110,6 +1105,8 @@ def _choose_session(
 def _choose_access_mode(
     input_fn: Callable[[str], str],
     logger: Callable[[str], None],
+    *,
+    prompt_style: bool = False,
 ) -> str | None:
     emit = logger or (lambda _: None)
     emit("权限选项：")
@@ -1118,7 +1115,12 @@ def _choose_access_mode(
     emit("b. 返回")
 
     while True:
-        choice = input_fn("选择权限编号，或输入 b 返回：").strip().lower()
+        prompt = (
+            "[bold cyan]选择权限编号[/bold cyan]，或输入 [bold]b[/bold] 返回："
+            if prompt_style
+            else "选择权限编号，或输入 b 返回："
+        )
+        choice = input_fn(prompt).strip().lower()
         if choice in {"b", "back"}:
             return None
         if choice == "1":
@@ -1148,6 +1150,42 @@ def _parse_subagents_command(user_text: str, current_state: bool) -> bool | None
     if option in {"toggle", "t"}:
         return not current_state
     return None
+
+
+def _is_known_slash_command(user_text: str) -> bool:
+    parts = user_text.strip().split()
+    if not parts:
+        return False
+
+    command = parts[0].lower()
+    return command in {
+        "/exit",
+        "exit",
+        "quit",
+        "/quit",
+        "/diff",
+        "diff",
+        "/undo",
+        "undo",
+        "/access",
+        "access",
+        "/perm",
+        "perm",
+        "/mode",
+        "mode",
+        "/subagents",
+        "subagents",
+        "/roles",
+        "roles",
+        "/reset",
+        "reset",
+        "/new",
+        "new",
+        "/choose",
+        "choose",
+        "/switch",
+        "switch",
+    }
 
 
 def _sync_session_state(
@@ -1304,6 +1342,7 @@ def _run_conversation(
     write_changes: list[dict[str, Any]] | None = None,
     logger: Callable[[str], None] | None = print,
     emit_final_result: bool = True,
+    ui: TerminalUI | None = None,
 ) -> str:
     settings = settings or load_settings()
     client = client or build_client(settings)
@@ -1323,19 +1362,21 @@ def _run_conversation(
             task_plan=task_plan,
             reviewer_feedback=reviewer_feedback,
         )
-        response = request_response(
-            client,
-            model=settings.model,
-            input=visible_conversation,
-            tools=tool_definitions(access_mode),
-            instructions=_build_instructions(
-                workspace_root=workspace_root,
-                session_memory=session_memory,
-                access_mode=access_mode,
-                task_plan=task_plan,
-                reviewer_feedback=reviewer_feedback,
-            ),
-        )
+        request_context = ui.status("思码智能体正在思考") if ui is not None else nullcontext()
+        with request_context:
+            response = request_response(
+                client,
+                model=settings.model,
+                input=visible_conversation,
+                tools=tool_definitions(access_mode),
+                instructions=_build_instructions(
+                    workspace_root=workspace_root,
+                    session_memory=session_memory,
+                    access_mode=access_mode,
+                    task_plan=task_plan,
+                    reviewer_feedback=reviewer_feedback,
+                ),
+            )
 
         tool_calls = [
             item
@@ -1368,13 +1409,21 @@ def _run_conversation(
                 )
                 continue
 
-            result = _call_tool(
-                item.name,
-                arguments,
-                workspace_root,
-                access_mode=access_mode,
-                write_changes=write_changes,
+            if ui is not None:
+                ui.emit(f"工具调用：{item.name} {getattr(item, 'arguments', '')}")
+            tool_context = (
+                ui.status(f"正在执行工具：{item.name}") if ui is not None else nullcontext()
             )
+            with tool_context:
+                result = _call_tool(
+                    item.name,
+                    arguments,
+                    workspace_root,
+                    access_mode=access_mode,
+                    write_changes=write_changes,
+                )
+            if ui is not None:
+                ui.emit(f"工具结果：{result}")
             conversation.append(
                 {
                     "type": "function_call_output",
@@ -1398,6 +1447,7 @@ def _run_task_with_optional_subagents(
     subagents_enabled: bool,
     write_changes: list[dict[str, Any]] | None = None,
     logger: Callable[[str], None] | None = print,
+    ui: TerminalUI | None = None,
 ) -> str:
     emit = logger or (lambda _: None)
     task_plan = ""
@@ -1409,6 +1459,7 @@ def _run_task_with_optional_subagents(
             access_mode=access_mode,
             client=client,
             settings=settings,
+            ui=ui,
         )
         if task_plan:
             emit(f"规划：{task_plan}")
@@ -1424,6 +1475,7 @@ def _run_task_with_optional_subagents(
         write_changes=write_changes,
         logger=logger,
         emit_final_result=False,
+        ui=ui,
     )
 
     if not subagents_enabled:
@@ -1440,6 +1492,7 @@ def _run_task_with_optional_subagents(
         access_mode=access_mode,
         client=client,
         settings=settings,
+        ui=ui,
     )
     if review["summary"]:
         emit(f"审查：{review['summary']}")
@@ -1459,6 +1512,7 @@ def _run_task_with_optional_subagents(
             write_changes=write_changes,
             logger=logger,
             emit_final_result=False,
+            ui=ui,
         )
 
     emit(f"最终结果：{final_text}")
@@ -1525,7 +1579,7 @@ def run_chat_session(
     workspace_root: Path,
     client: Any | None = None,
     settings: Settings | None = None,
-    logger: Callable[[str], None] | None = print,
+    logger: Callable[[str], None] | None = None,
     input_fn: Callable[[str], str] = input,
     background_finalize: bool = False,
     subagents_enabled: bool = False,
@@ -1533,7 +1587,14 @@ def run_chat_session(
     settings = settings or load_settings()
     client = client or build_client(settings)
     workspace_root = workspace_root.resolve()
-    emit = logger or (lambda _: None)
+    terminal_ui: TerminalUI | None = None
+    if logger is None and input_fn is input:
+        terminal_ui = create_terminal_ui()
+        emit = terminal_ui.emit
+        read_input = terminal_ui.input
+    else:
+        emit = logger or (lambda _: None)
+        read_input = input_fn
     sessions_index_path = _sessions_index_file(workspace_root)
     sessions = _load_sessions_index(sessions_index_path)
     legacy_conversation_path = _conversation_file(workspace_root)
@@ -1549,8 +1610,6 @@ def run_chat_session(
             _save_sessions_index(sessions_index_path, sessions)
             _clear_conversation(legacy_conversation_path)
 
-    emit("进入对话模式，输入 /exit 退出，/reset 清空历史，/choose 选择对话，/access 切换权限，/diff 查看差异，/undo 撤销写入")
-
     active_session = _create_session_record()
     _set_session_subagents_enabled(active_session, subagents_enabled)
     active_session_path = _session_path(workspace_root, str(active_session["id"]))
@@ -1558,7 +1617,15 @@ def run_chat_session(
     session_memory = _default_session_memory()
     active_session_persisted = False
     pending_finalizers: dict[str, Any] = {}
-    emit(f"当前权限：{_access_mode_label(_session_access_mode(active_session))}，输入 /access 切换")
+    if terminal_ui is not None:
+        terminal_ui.banner(
+            workspace_root=workspace_root,
+            model=settings.model,
+        )
+        terminal_ui.render_state(
+            access_mode=_access_mode_label(_session_access_mode(active_session)),
+            subagents_enabled=_session_subagents_enabled(active_session),
+        )
 
     def _wait_for_finalizer(session_id: str) -> None:
         thread = pending_finalizers.get(session_id)
@@ -1605,11 +1672,15 @@ def run_chat_session(
         if not conversation:
             return
         _wait_for_finalizer(str(active_session["id"]))
-        session_memory = _finalize_snapshot(
-            session_snapshot=active_session,
-            conversation_snapshot=conversation,
-            keep_empty=active_session_persisted,
+        finalize_context = (
+            terminal_ui.status("正在整理会话记录") if terminal_ui is not None else nullcontext()
         )
+        with finalize_context:
+            session_memory = _finalize_snapshot(
+                session_snapshot=active_session,
+                conversation_snapshot=conversation,
+                keep_empty=active_session_persisted,
+            )
         sessions = _load_sessions_index(sessions_index_path)
         active_session_persisted = True
 
@@ -1631,7 +1702,8 @@ def run_chat_session(
 
     while True:
         try:
-            user_text = input_fn("你> ").strip()
+            prompt = "[bold cyan]你[/bold cyan]> " if terminal_ui is not None else "你> "
+            user_text = read_input(prompt).strip()
         except EOFError:
             finalize_current_session()
             break
@@ -1669,7 +1741,11 @@ def run_chat_session(
             emit(_undo_last_write_batch(workspace_root, str(active_session["id"])))
             continue
         if user_text in {"/access", "access", "/perm", "perm", "/mode", "mode"}:
-            selected_mode = _choose_access_mode(input_fn, emit)
+            selected_mode = _choose_access_mode(
+                read_input,
+                emit,
+                prompt_style=terminal_ui is not None,
+            )
             if selected_mode is None:
                 continue
             _set_session_access_mode(active_session, selected_mode)
@@ -1681,6 +1757,11 @@ def run_chat_session(
                 conversation=conversation,
             )
             emit(f"当前权限已切换为：{_access_mode_label(selected_mode)}")
+            if terminal_ui is not None:
+                terminal_ui.render_state(
+                    access_mode=_access_mode_label(_session_access_mode(active_session)),
+                    subagents_enabled=_session_subagents_enabled(active_session),
+                )
             continue
         next_subagents_state = _parse_subagents_command(
             user_text,
@@ -1696,6 +1777,14 @@ def run_chat_session(
                 conversation=conversation,
             )
             emit(f"当前分工已切换为：{_subagents_enabled_label(next_subagents_state)}")
+            if terminal_ui is not None:
+                terminal_ui.render_state(
+                    access_mode=_access_mode_label(_session_access_mode(active_session)),
+                    subagents_enabled=_session_subagents_enabled(active_session),
+                )
+            continue
+        if user_text.startswith("/") and not _is_known_slash_command(user_text):
+            emit(f"错误：没有这个功能：{user_text.split()[0]}")
             continue
         if user_text in {"/reset", "reset"}:
             finalize_current_session()
@@ -1721,7 +1810,12 @@ def run_chat_session(
             active_session_persisted = False
             continue
         if user_text in {"/choose", "choose", "/switch", "switch"}:
-            selected_session = _choose_session(sessions, input_fn, emit)
+            selected_session = _choose_session(
+                sessions,
+                read_input,
+                emit,
+                prompt_style=terminal_ui is not None,
+            )
             if selected_session is None:
                 continue
             existing_session = any(
@@ -1764,8 +1858,11 @@ def run_chat_session(
             )
             if existing_session:
                 active_session["message_count"] = len(conversation)
-                _print_conversation_history(conversation, emit)
-            emit(f"当前权限：{_access_mode_label(_session_access_mode(active_session))}，输入 /access 切换")
+                if terminal_ui is not None:
+                    terminal_ui.render_state(
+                        access_mode=_access_mode_label(_session_access_mode(active_session)),
+                        subagents_enabled=_session_subagents_enabled(active_session),
+                    )
             continue
 
         if _should_title_from_first_message(active_session):
@@ -1788,7 +1885,8 @@ def run_chat_session(
                 access_mode=_session_access_mode(active_session),
                 subagents_enabled=_session_subagents_enabled(active_session),
                 write_changes=write_changes,
-                logger=logger,
+                logger=emit,
+                ui=terminal_ui,
             )
         except RuntimeError as exc:
             emit(f"最终结果：错误：{exc}")
