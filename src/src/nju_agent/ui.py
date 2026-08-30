@@ -82,8 +82,7 @@ class TerminalUI:
         )
 
     def render_conversation_history(self, conversation: list[dict[str, object]]) -> None:
-        body = Text()
-        has_content = False
+        body_items: list[object] = []
 
         for item in conversation:
             item_type = str(item.get("type", "")).strip()
@@ -112,15 +111,19 @@ class TerminalUI:
             if not content:
                 continue
 
-            if has_content:
-                body.append("\n")
-            has_content = True
-            body.append(label, style=style)
-            body.append("：", style="dim")
-            body.append(content)
+            if body_items:
+                body_items.append(Text(""))
+            body_items.append(Text(f"{label}：", style=style))
+            if item_type == "function_call":
+                body_items.append(Text(content))
+            elif item_type == "function_call_output":
+                body_items.append(self._render_history_output(content))
+            elif role == "assistant":
+                body_items.append(Markdown(content or "（空）"))
+            else:
+                body_items.append(Text(content))
 
-        if not has_content:
-            body = Text("（空）", style="dim")
+        body: object = Group(*body_items) if body_items else Text("（空）", style="dim")
 
         self.console.print(
             Panel(
@@ -182,7 +185,7 @@ class TerminalUI:
             self._render_text_panel("你", content, "cyan")
             return
         if label == "助手":
-            self._render_text_panel("助手", content, "white")
+            self._render_markdown_panel("助手", content, "white")
             return
         if label in {"当前权限", "当前分工"}:
             self.console.print(f"[dim]{label}：{content}[/dim]")
@@ -277,6 +280,18 @@ class TerminalUI:
             text.append("\n")
             text.append(f"最近：{preview}", style="white")
         return text
+
+    def _render_history_output(self, content: str) -> object:
+        text = content.strip()
+        if not text:
+            return Text("（空）", style="dim")
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return Text(text, style="grey70")
+        if isinstance(data, (dict, list)):
+            return Pretty(data, expand_all=True, max_depth=4)
+        return Text(text, style="grey70")
 
 
 def create_terminal_ui() -> TerminalUI:
