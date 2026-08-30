@@ -1047,6 +1047,36 @@ def _session_label(session: dict[str, Any]) -> str:
     return "未命名会话"
 
 
+def _emit_conversation_history(
+    conversation: list[dict[str, Any]],
+    logger: Callable[[str], None],
+) -> None:
+    emit = logger or (lambda _: None)
+    if not conversation:
+        return
+
+    emit("历史消息：")
+    for item in conversation:
+        item_type = str(item.get("type", "")).strip()
+        role = str(item.get("role", "")).strip()
+        if item_type == "function_call":
+            content = f"{item.get('name', '')} {item.get('arguments', '')}".strip()
+            if content:
+                emit(f"工具调用：{content}")
+        elif item_type == "function_call_output":
+            content = str(item.get("output", "")).strip()
+            if content:
+                emit(f"工具结果：{content}")
+        else:
+            content = str(item.get("content", "")).strip()
+            if not content:
+                continue
+            if role == "user":
+                emit(f"你：{content}")
+            elif role == "assistant":
+                emit(f"助手：{content}")
+
+
 def _derive_session_title(text: str) -> str:
     text = " ".join(text.split()).strip()
     if not text:
@@ -1074,15 +1104,47 @@ def _choose_session(
     input_fn: Callable[[str], str],
     logger: Callable[[str], None],
     *,
+    ui: TerminalUI | None = None,
     prompt_style: bool = False,
 ) -> dict[str, Any] | None:
     emit = logger or (lambda _: None)
     if not sessions:
         return _create_session_record()
 
-    emit("可用会话：")
-    for index, session in enumerate(sessions, start=1):
-        emit(f"{index}. {_session_label(session)}")
+    def _safe_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    if ui is not None:
+        ui.render_session_picker(
+            [
+                {
+                    "index": index,
+                    "title": _session_label(session),
+                    "updated_at": datetime.fromtimestamp(
+                        _safe_float(session.get("updated_at", 0.0) or 0.0)
+                    ).strftime("%Y-%m-%d %H:%M:%S"),
+                    "message_count": str(_safe_int(session.get("message_count", 0) or 0)),
+                    "status": (
+                        f"{_access_mode_label(_session_access_mode(session))}"
+                        f" · subagents {_subagents_enabled_label(_session_subagents_enabled(session))}"
+                    ),
+                }
+                for index, session in enumerate(sessions, start=1)
+            ]
+        )
+    else:
+        emit("可用会话：")
+        for index, session in enumerate(sessions, start=1):
+            emit(f"{index}. {_session_label(session)}")
 
     while True:
         prompt = (
@@ -1362,7 +1424,7 @@ def _run_conversation(
             task_plan=task_plan,
             reviewer_feedback=reviewer_feedback,
         )
-        request_context = ui.status("思码智能体正在思考") if ui is not None else nullcontext()
+        request_context = ui.status("SimaAgent正在思考") if ui is not None else nullcontext()
         with request_context:
             response = request_response(
                 client,
@@ -1814,6 +1876,7 @@ def run_chat_session(
                 sessions,
                 read_input,
                 emit,
+                ui=terminal_ui,
                 prompt_style=terminal_ui is not None,
             )
             if selected_session is None:
@@ -1859,10 +1922,13 @@ def run_chat_session(
             if existing_session:
                 active_session["message_count"] = len(conversation)
                 if terminal_ui is not None:
+                    terminal_ui.render_conversation_history(conversation)
                     terminal_ui.render_state(
                         access_mode=_access_mode_label(_session_access_mode(active_session)),
                         subagents_enabled=_session_subagents_enabled(active_session),
                     )
+                else:
+                    _emit_conversation_history(conversation, emit)
             continue
 
         if _should_title_from_first_message(active_session):

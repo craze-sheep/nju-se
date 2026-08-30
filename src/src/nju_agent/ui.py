@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterator
 
 from rich import box
-from rich.console import Console
+from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
@@ -57,6 +57,82 @@ class TerminalUI:
         state.append("开启" if subagents_enabled else "关闭", style="magenta" if subagents_enabled else "yellow")
         self.console.print(state)
 
+    def render_session_picker(self, entries: list[dict[str, object]]) -> None:
+        body = Table.grid(expand=True, padding=(0, 0))
+        body.add_column()
+
+        if not entries:
+            body.add_row(Text("没有可用会话，输入 n 新建。", style="dim"))
+        else:
+            for index, entry in enumerate(entries):
+                body.add_row(self._render_session_entry(entry))
+                if index < len(entries) - 1:
+                    body.add_row(Text(""))
+
+        hint = Text("输入编号切换，n 新建，b 返回", style="dim")
+        self.console.print(
+            Panel(
+                Group(body, hint),
+                title="[bold cyan]历史会话[/bold cyan]",
+                border_style="cyan",
+                box=box.ROUNDED,
+                expand=True,
+                padding=(0, 1),
+            )
+        )
+
+    def render_conversation_history(self, conversation: list[dict[str, object]]) -> None:
+        body = Text()
+        has_content = False
+
+        for item in conversation:
+            item_type = str(item.get("type", "")).strip()
+            role = str(item.get("role", "")).strip()
+            content = str(item.get("content", item.get("output", ""))).strip()
+
+            if item_type == "function_call":
+                name = str(item.get("name", "")).strip()
+                arguments = str(item.get("arguments", "")).strip()
+                content = f"{name} {arguments}".strip()
+                label = "工具调用"
+                style = "yellow"
+            elif item_type == "function_call_output":
+                content = str(item.get("output", "")).strip()
+                label = "工具结果"
+                style = "grey70"
+            elif role == "user":
+                label = "你"
+                style = "bold cyan"
+            elif role == "assistant":
+                label = "助手"
+                style = "bold white"
+            else:
+                continue
+
+            if not content:
+                continue
+
+            if has_content:
+                body.append("\n")
+            has_content = True
+            body.append(label, style=style)
+            body.append("：", style="dim")
+            body.append(content)
+
+        if not has_content:
+            body = Text("（空）", style="dim")
+
+        self.console.print(
+            Panel(
+                body,
+                title="[bold cyan]历史会话[/bold cyan]",
+                border_style="cyan",
+                box=box.ROUNDED,
+                expand=True,
+                padding=(0, 1),
+            )
+        )
+
     def input(self, prompt: str) -> str:
         return self.console.input(prompt)
 
@@ -103,10 +179,10 @@ class TerminalUI:
             self._render_tool_result_panel(content)
             return
         if label == "你":
-            self.console.print(f"[bold cyan]你[/bold cyan]：{content}")
+            self._render_text_panel("你", content, "cyan")
             return
         if label == "助手":
-            self.console.print(f"[bold white]助手[/bold white]：{content}")
+            self._render_text_panel("助手", content, "white")
             return
         if label in {"当前权限", "当前分工"}:
             self.console.print(f"[dim]{label}：{content}[/dim]")
@@ -126,11 +202,12 @@ class TerminalUI:
         if bold:
             panel_content = Text.from_markup(f"[bold]{content or '（空）'}[/bold]")
         self.console.print(
-            Panel.fit(
+            Panel(
                 panel_content,
                 title=title,
                 border_style=border_style,
                 box=box.ROUNDED,
+                expand=True,
                 padding=(0, 1),
             )
         )
@@ -148,11 +225,12 @@ class TerminalUI:
                     renderable = Pretty(data, expand_all=True, max_depth=6)
 
         self.console.print(
-            Panel.fit(
+            Panel(
                 renderable,
                 title="工具结果",
                 border_style="grey50",
                 box=box.ROUNDED,
+                expand=True,
                 padding=(0, 1),
             )
         )
@@ -167,14 +245,38 @@ class TerminalUI:
     ) -> None:
         style = "bold " + border_style if bold else border_style
         self.console.print(
-            Panel.fit(
+            Panel(
                 Text(content or "（空）", style=style),
                 title=title,
                 border_style=border_style,
                 box=box.ROUNDED,
+                expand=True,
                 padding=(0, 1),
             )
         )
+
+    def _render_session_entry(self, entry: dict[str, object]) -> Text:
+        index = str(entry.get("index", "")).strip()
+        title = str(entry.get("title", "")).strip() or "未命名会话"
+        current = bool(entry.get("current", False))
+        updated_at = str(entry.get("updated_at", "")).strip()
+        message_count = str(entry.get("message_count", "")).strip()
+        status = str(entry.get("status", "")).strip()
+        preview = str(entry.get("preview", "")).strip()
+
+        text = Text()
+        text.append(f"{index}. {title}", style="bold cyan" if current else "bold")
+        if current:
+            text.append("  当前", style="magenta")
+        text.append("\n")
+
+        meta_parts = [part for part in [updated_at, message_count, status] if part]
+        if meta_parts:
+            text.append(" · ".join(meta_parts), style="dim")
+        if preview:
+            text.append("\n")
+            text.append(f"最近：{preview}", style="white")
+        return text
 
 
 def create_terminal_ui() -> TerminalUI:

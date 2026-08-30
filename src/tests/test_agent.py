@@ -824,3 +824,23 @@ def test_terminal_ui_state_is_separate_from_banner() -> None:
     text = console.export_text(clear=False)
     assert "编辑权限" in text
     assert "subagents" in text
+
+
+def test_terminal_ui_panels_use_full_width() -> None:
+    console = Console(record=True, width=60)
+    ui = TerminalUI(console=console)
+
+    ui.emit('工具调用：read_file {"relative_path": "src/src/nju_agent/__init__.py"}')
+    ui.emit('工具结果：{"ok": true, "message": "hello"}')
+    ui.render_conversation_history(
+        [
+            {"role": "user", "content": "first line"},
+            {"role": "assistant", "content": "second line"},
+        ]
+    )
+
+    text = console.export_text(clear=False)
+    assert "工具调用" in text
+    assert "工具结果" in text
+    assert "历史会话" in text
+    assert max(len(line) for line in text.splitlines()) <= 60
