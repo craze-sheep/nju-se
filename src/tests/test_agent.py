@@ -607,6 +607,22 @@ def test_run_agent_read_only_blocks_write_tool(tmp_path: Path) -> None:
     assert not (tmp_path / "blocked.txt").exists()
 
 
+def test_call_tool_cancels_dangerous_command(tmp_path: Path) -> None:
+    target = tmp_path / "danger.txt"
+    target.write_text("keep", encoding="utf-8")
+
+    result = agent_module._call_tool(
+        "run_command",
+        {"command": ["rm", "-rf", str(target)]},
+        tmp_path,
+        ACCESS_WRITE,
+        confirm_input_fn=lambda prompt: "no",
+    )
+
+    assert result.startswith("已取消执行危险命令：")
+    assert target.exists()
+
+
 def test_run_agent_with_subagents_plans_reviews_and_retries(tmp_path: Path) -> None:
     calls: list[dict[str, object]] = []
 

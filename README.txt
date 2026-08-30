@@ -27,4 +27,4 @@ Semacode Agent（思码智能体）：以语义建模为内核的 coding agent�
 
 补充说明：
 - API key 只通过环境变量提供，不写入仓库、README.txt 或视频
-- 如需本地直跑 `run_command`，可设置 `NJU_AGENT_RUN_COMMAND_MODE=local`
+- `run_command` 默认本地执行；危险命令会在执行前要求确认

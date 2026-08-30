@@ -48,7 +48,7 @@
 - 工具逻辑在本地自行实现
 - 默认只读，需要时可用 `/access` 切到可写
 - 输入 `/subagents` 可以打开或关闭轻量 subagent 分工；planner / reviewer 不带工具权限
-- `run_command` 默认走 Docker 常驻沙箱容器；`NJU_AGENT_RUN_COMMAND_MODE=local` 仅用于显式开发模式
+- `run_command` 默认本地执行；危险命令会在执行前要求确认
 
 启动后直接进入对话模式：
 

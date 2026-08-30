@@ -1,6 +1,4 @@
 from dataclasses import dataclass
-import hashlib
-import os
 from pathlib import Path
 import subprocess
 
@@ -18,11 +16,6 @@ class WriteResult:
     existed_before: bool
     tracked_before: bool
     diff: str
-
-
-_SANDBOX_IMAGE = "nju-agent-sandbox:latest"
-_SANDBOX_WORKDIR = "/workspace"
-_SANDBOX_CONTAINER_PREFIX = "nju_agent_sandbox"
 
 
 def _safe_path(root: str, relative_path: str) -> Path:
@@ -54,120 +47,6 @@ def _subprocess_run(
         )
     except FileNotFoundError as exc:
         raise RuntimeError(f"Required executable not found: {args[0]}") from exc
-
-
-def _sandbox_mode() -> str:
-    return os.environ.get("NJU_AGENT_RUN_COMMAND_MODE", "docker").strip().lower()
-
-
-def _sandbox_image() -> str:
-    return os.environ.get("NJU_AGENT_SANDBOX_IMAGE", _SANDBOX_IMAGE).strip() or _SANDBOX_IMAGE
-
-
-def _sandbox_dockerfile_path() -> Path:
-    return Path(__file__).resolve().parents[2] / "docker" / "sandbox.Dockerfile"
-
-
-def _workspace_hash(root: str) -> str:
-    return hashlib.sha256(str(Path(root).resolve()).encode("utf-8")).hexdigest()[:12]
-
-
-def _sandbox_container_name(root: str) -> str:
-    return f"{_SANDBOX_CONTAINER_PREFIX}_{_workspace_hash(root)}"
-
-
-def _docker(args: list[str], *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
-    return _subprocess_run(["docker", *args], timeout=timeout)
-
-
-def _docker_inspect_text(args: list[str]) -> str | None:
-    result = _docker(args, timeout=30)
-    if result.returncode != 0:
-        return None
-    text = result.stdout.strip()
-    return text or None
-
-
-def _ensure_sandbox_image(image: str) -> None:
-    if _docker(["image", "inspect", image], timeout=30).returncode == 0:
-        return
-
-    dockerfile = _sandbox_dockerfile_path()
-    if not dockerfile.exists():
-        raise RuntimeError(f"Sandbox Dockerfile not found: {dockerfile}")
-
-    result = _docker(
-        ["build", "-t", image, "-f", str(dockerfile), str(dockerfile.parent)],
-        timeout=600,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "Failed to build sandbox image")
-
-
-def _create_sandbox_container(root: str, image: str, container: str) -> None:
-    base = Path(root).resolve()
-    uid = getattr(os, "getuid", lambda: 0)()
-    gid = getattr(os, "getgid", lambda: 0)()
-    result = _docker(
-        [
-            "run",
-            "-d",
-            "--name",
-            container,
-            "--network",
-            "none",
-            "--cap-drop=ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--pids-limit",
-            "128",
-            "--memory",
-            "1g",
-            "--cpus",
-            "1",
-            "--user",
-            f"{uid}:{gid}",
-            "-e",
-            "HOME=/tmp",
-            "-e",
-            "TMPDIR=/tmp",
-            "-v",
-            f"{base}:/workspace:rw",
-            "-w",
-            _SANDBOX_WORKDIR,
-            image,
-            "sleep",
-            "infinity",
-        ],
-        timeout=60,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "Failed to create sandbox container")
-
-
-def _ensure_sandbox_container(root: str) -> str:
-    image = _sandbox_image()
-    container = _sandbox_container_name(root)
-    _ensure_sandbox_image(image)
-
-    existing_image = _docker_inspect_text(["container", "inspect", "--format", "{{.Config.Image}}", container])
-    if existing_image and existing_image != image:
-        _docker(["rm", "-f", container], timeout=30)
-        existing_image = None
-
-    status = None if existing_image is None else _docker_inspect_text(
-        ["container", "inspect", "--format", "{{.State.Status}}", container]
-    )
-    if not status:
-        _create_sandbox_container(root, image, container)
-        return container
-
-    if status != "running":
-        result = _docker(["start", container], timeout=30)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or f"Failed to start sandbox container {container}")
-
-    return container
 
 
 def list_files(root: str) -> list[str]:
@@ -286,65 +165,20 @@ def run_command(root: str, command: list[str], timeout: float = 10.0) -> Command
     if not command:
         raise ValueError("Command cannot be empty")
 
-    if _sandbox_mode() == "local":
-        try:
-            result = subprocess.run(
-                command,
-                cwd=base,
-                text=True,
-                capture_output=True,
-                timeout=timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError(f"Command timed out after {timeout} seconds") from exc
-        return CommandResult(
-            exit_code=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
-        )
-
-    if _sandbox_mode() != "docker":
-        raise RuntimeError("NJU_AGENT_RUN_COMMAND_MODE must be 'docker' or 'local'")
-
-    container = _ensure_sandbox_container(str(base))
-    uid = getattr(os, "getuid", lambda: 0)()
-    gid = getattr(os, "getgid", lambda: 0)()
-    docker_timeout = max(float(timeout) + 5.0, 10.0)
-    result = _docker(
-        [
-            "exec",
-            "-u",
-            f"{uid}:{gid}",
-            "-e",
-            "HOME=/tmp",
-            "-e",
-            "TMPDIR=/tmp",
-            "-w",
-            _SANDBOX_WORKDIR,
-            container,
-            "timeout",
-            "--kill-after=5s",
-            "--signal=KILL",
-            f"{float(timeout)}s",
-            *command,
-        ],
-        timeout=docker_timeout,
-    )
-    if result.returncode in {124, 137}:
-        raise TimeoutError(f"Command timed out after {timeout} seconds")
-
-    if result.returncode < 0:
-        raise RuntimeError(f"Sandbox command failed: {result.stderr.strip() or result.stdout.strip()}")
-
     try:
-        stdout = result.stdout
-        stderr = result.stderr
-    except AttributeError as exc:
-        raise RuntimeError("Sandbox command returned unexpected result") from exc
+        result = subprocess.run(
+            command,
+            cwd=base,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"Command timed out after {timeout} seconds") from exc
 
     return CommandResult(
         exit_code=result.returncode,
-        stdout=stdout,
-        stderr=stderr,
+        stdout=result.stdout,
+        stderr=result.stderr,
     )

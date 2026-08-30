@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -1214,6 +1215,31 @@ def _parse_subagents_command(user_text: str, current_state: bool) -> bool | None
     return None
 
 
+def _dangerous_command_reason(command: list[str]) -> str | None:
+    if not command:
+        return None
+
+    text = " ".join(str(part) for part in command).lower()
+    patterns = [
+        (r"(?<!\w)rm(?!\w)", "rm"),
+        (r"(?<!\w)rmdir(?!\w)", "rmdir"),
+        (r"(?<!\w)unlink(?!\w)", "unlink"),
+        (r"(?<!\w)shred(?!\w)", "shred"),
+        (r"(?<!\w)dd(?!\w)", "dd"),
+        (r"(?<!\w)mkfs\w*(?!\w)", "mkfs"),
+        (r"(?<!\w)killall(?!\w)", "killall"),
+        (r"(?<!\w)pkill(?!\w)", "pkill"),
+        (r"(?<!\w)kill(?!\w)", "kill"),
+        (r"(?<!\w)chmod(?!\w)", "chmod"),
+        (r"(?<!\w)chown(?!\w)", "chown"),
+        (r"git\s+(clean|reset|restore|checkout)\b", "git"),
+    ]
+    for pattern, label in patterns:
+        if re.search(pattern, text):
+            return label
+    return None
+
+
 def _is_known_slash_command(user_text: str) -> bool:
     parts = user_text.strip().split()
     if not parts:
@@ -1342,6 +1368,8 @@ def _call_tool(
     workspace_root: Path,
     access_mode: str,
     write_changes: list[dict[str, Any]] | None = None,
+    confirm_input_fn: Callable[[str], str] | None = None,
+    ui: TerminalUI | None = None,
 ) -> str:
     root = str(workspace_root)
 
@@ -1373,9 +1401,25 @@ def _call_tool(
         if name == "run_command":
             if not _can_use_write_tools(access_mode):
                 return "错误：当前会话是只读权限，不能使用 run_command"
+            command = arguments["command"]
+            if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+                return "错误：run_command 的 command 参数必须是字符串数组"
+            reason = _dangerous_command_reason(command)
+            if reason is not None:
+                if confirm_input_fn is None:
+                    return f"错误：检测到危险命令（{reason}），当前会话没有确认入口"
+                prompt = (
+                    f"[bold red]危险命令[/bold red]：{reason} -> [bold]{' '.join(command)}[/bold]\n"
+                    "输入 [bold]yes[/bold] 继续，其他内容取消："
+                    if ui is not None
+                    else f"危险命令：{reason} -> {' '.join(command)}\n输入 yes 继续，其他内容取消："
+                )
+                answer = confirm_input_fn(prompt).strip().lower()
+                if answer not in {"y", "yes", "是", "确认", "继续", "ok", "okay"}:
+                    return f"已取消执行危险命令：{' '.join(command)}"
             result = run_command(
                 root,
-                arguments["command"],
+                command,
                 timeout=float(arguments.get("timeout", 10.0)),
             )
             return _format_tool_result(
@@ -1405,6 +1449,7 @@ def _run_conversation(
     logger: Callable[[str], None] | None = print,
     emit_final_result: bool = True,
     ui: TerminalUI | None = None,
+    confirm_input_fn: Callable[[str], str] | None = None,
 ) -> str:
     settings = settings or load_settings()
     client = client or build_client(settings)
@@ -1483,6 +1528,8 @@ def _run_conversation(
                     workspace_root,
                     access_mode=access_mode,
                     write_changes=write_changes,
+                    confirm_input_fn=confirm_input_fn,
+                    ui=ui,
                 )
             if ui is not None:
                 ui.emit(f"工具结果：{result}")
@@ -1510,6 +1557,7 @@ def _run_task_with_optional_subagents(
     write_changes: list[dict[str, Any]] | None = None,
     logger: Callable[[str], None] | None = print,
     ui: TerminalUI | None = None,
+    confirm_input_fn: Callable[[str], str] | None = None,
 ) -> str:
     emit = logger or (lambda _: None)
     task_plan = ""
@@ -1538,6 +1586,7 @@ def _run_task_with_optional_subagents(
         logger=logger,
         emit_final_result=False,
         ui=ui,
+        confirm_input_fn=confirm_input_fn,
     )
 
     if not subagents_enabled:
@@ -1575,6 +1624,7 @@ def _run_task_with_optional_subagents(
             logger=logger,
             emit_final_result=False,
             ui=ui,
+            confirm_input_fn=confirm_input_fn,
         )
 
     emit(f"最终结果：{final_text}")
@@ -1953,6 +2003,7 @@ def run_chat_session(
                 write_changes=write_changes,
                 logger=emit,
                 ui=terminal_ui,
+                confirm_input_fn=read_input,
             )
         except RuntimeError as exc:
             emit(f"最终结果：错误：{exc}")
