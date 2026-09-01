@@ -1,0 +1,30 @@
+- main "Semacode Agent 讲解开场页" [ref=e2]:
+  - generic [ref=e3]:
+    - generic [ref=e4]:
+      - paragraph [ref=e5]: 讲解次序
+      - generic [ref=e6]:
+        - generic [ref=e7]:
+          - generic [ref=e8]: "01"
+          - generic [ref=e9]: 开发环境介绍
+        - generic [ref=e10]:
+          - generic [ref=e11]: "02"
+          - generic [ref=e12]: 开发流程介绍
+        - generic [ref=e13]:
+          - generic [ref=e14]: "03"
+          - generic [ref=e15]: Agent功能介绍
+        - generic [ref=e16]:
+          - generic [ref=e17]: "04"
+          - generic [ref=e18]: 实操展示
+    - generic [ref=e19]:
+      - generic [ref=e20]:
+        - paragraph [ref=e21]: NJU 推免考核项目 · 构建编程智能体
+        - heading "Semacode Agent 析码智能体" [level=1] [ref=e22]:
+          - text: Semacode Agent
+          - generic [ref=e23]: 析码智能体
+        - paragraph [ref=e24]: 思考符号，理解代码
+        - paragraph [ref=e25]: Semacode 取自语义学（semantics）与符号学的共同词根，也是“析码”的本义。 本智能体不将代码视为无意义的字符串，而视为承载意图的符号结构， 以程序语义建模为内核，在需求理解、代码生成、检索与修复的全过程中保持意图一致。
+      - generic [ref=e26]:
+        - generic [ref=e27]: NJU
+        - generic [ref=e28]:
+          - generic [ref=e29]: 南京大学
+          - generic [ref=e30]: NANJING UNIVERSITY

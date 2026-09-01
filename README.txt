@@ -1,6 +1,6 @@
 NJU 推免考核项目：构建编程智能体
 
-Semacode Agent（思码智能体）：以语义建模为内核的 coding agent，面向需求理解、代码生成、检索与修复，保持意图一致。
+Semacode Agent（析码智能体）：以语义建模为内核的 coding agent，面向需求理解、代码生成、检索与修复，保持意图一致。
 
 仓库地址：https://github.com/craze-sheep/nju-se.git
 
