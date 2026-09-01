@@ -101,7 +101,7 @@ git push
 - `list_files(root)` 返回目录文件名。
 - `read_file(root, path)` 读取文本内容。
 - `write_file(root, path, content)` 写入文本内容。
-- `run_command(root, command)` 执行简单命令并返回输出。
+- `run_command(root, command)` 在当前工作区本地执行命令并返回输出。
 - 文件路径不能逃出 `root`。
 - 命令超时时返回错误。
 - 只读会话下不暴露 `write_file` / `run_command`。
@@ -173,7 +173,7 @@ git push
 - 如果模型请求工具，agent 执行工具后继续循环。
 - 超过最大轮数时停止。
 - 工具失败时把错误返回给模型。
-- 只读模式下只暴露 `list_files` / `read_file`，可写模式下再开放 `write_file` / `run_command`。
+- 只读模式下只暴露 `list_files` / `read_file`，可写模式下再开放 `write_file` / `run_command`；危险命令执行前先确认。
 
 再实现：
 

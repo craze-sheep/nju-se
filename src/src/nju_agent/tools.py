@@ -1,3 +1,4 @@
+import difflib
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess
@@ -15,6 +16,7 @@ class WriteResult:
     relative_path: str
     existed_before: bool
     tracked_before: bool
+    before_content: str | None
     diff: str
 
 
@@ -51,7 +53,11 @@ def _subprocess_run(
 
 def list_files(root: str) -> list[str]:
     base = Path(root).resolve()
-    return sorted(path.name for path in base.iterdir())
+    return sorted(
+        path.name
+        for path in base.iterdir()
+        if path.name not in {".git", ".nju_agent"}
+    )
 
 
 def read_file(root: str, relative_path: str) -> str:
@@ -106,28 +112,67 @@ def _git_diff_text(
     return ""
 
 
+def _text_diff(relative_path: str, before: str, after: str) -> str:
+    return "\n".join(
+        difflib.unified_diff(
+            before.splitlines(),
+            after.splitlines(),
+            fromfile=f"a/{relative_path}",
+            tofile=f"b/{relative_path}",
+            lineterm="",
+        )
+    ).rstrip()
+
+
+def _prune_empty_parent_dirs(path: Path, stop_at: Path) -> None:
+    current = path
+    while current != stop_at:
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+
+
 def write_file(root: str, relative_path: str, content: str) -> WriteResult:
     target = _safe_path(root, relative_path)
     existed_before = target.exists()
+    if existed_before:
+        try:
+            before_content = target.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            before_content = None
+    else:
+        before_content = None
     git_root = _git_repo_root(root)
     tracked_before = bool(git_root) and _git_is_tracked(root, relative_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
-    diff = (
-        _git_diff_text(
+    if git_root and tracked_before:
+        diff = _git_diff_text(
             root,
             target,
             relative_path,
             existed_before=existed_before,
             tracked_before=tracked_before,
         )
-        if git_root
-        else ""
-    )
+    elif existed_before:
+        diff = _text_diff(relative_path, before_content or "", content)
+    elif git_root:
+        diff = _git_diff_text(
+            root,
+            target,
+            relative_path,
+            existed_before=existed_before,
+            tracked_before=tracked_before,
+        )
+    else:
+        diff = _text_diff(relative_path, "", content)
     return WriteResult(
         relative_path=relative_path,
         existed_before=existed_before,
         tracked_before=tracked_before,
+        before_content=before_content,
         diff=diff,
     )
 
@@ -137,11 +182,11 @@ def revert_write_file(root: str, change: dict[str, object]) -> None:
     _safe_path(root, relative_path)
     existed_before = bool(change.get("existed_before", False))
     tracked_before = bool(change.get("tracked_before", False))
+    before_content = change.get("before_content", None)
     git_root = _git_repo_root(root)
-    if not git_root:
-        raise RuntimeError("Git repository not found")
-
     if tracked_before:
+        if not git_root:
+            raise RuntimeError("Git repository not found")
         result = _run_git(
             root,
             ["restore", "--source=HEAD", "--worktree", "--staged", "--", relative_path],
@@ -150,13 +195,17 @@ def revert_write_file(root: str, change: dict[str, object]) -> None:
             return
         raise RuntimeError(result.stderr.strip() or f"git restore failed for {relative_path}")
 
-    if not existed_before:
-        result = _run_git(root, ["clean", "-f", "--", relative_path])
-        if result.returncode == 0:
-            return
-        raise RuntimeError(result.stderr.strip() or f"git clean failed for {relative_path}")
+    target = _safe_path(root, relative_path)
+    if existed_before:
+        if before_content is None:
+            raise RuntimeError(f"缺少写前快照，无法撤销：{relative_path}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(before_content), encoding="utf-8")
+        return
 
-    raise RuntimeError(f"无法仅用 Git 撤销未跟踪文件的修改：{relative_path}")
+    if target.exists():
+        target.unlink()
+    _prune_empty_parent_dirs(target.parent, Path(root).resolve())
 
 
 def run_command(root: str, command: list[str], timeout: float = 10.0) -> CommandResult:

@@ -80,6 +80,13 @@ def _incremental_memory_response() -> SimpleNamespace:
     )
 
 
+def _fenced_json_response(payload: dict[str, object], *, id_suffix: str) -> SimpleNamespace:
+    return _message_response(
+        f"```json\n{json.dumps(payload, ensure_ascii=False)}\n```",
+        id_suffix=id_suffix,
+    )
+
+
 def _review_response(
     *,
     summary: str,
@@ -156,6 +163,57 @@ def test_compact_session_memory_if_needed_updates_memory(tmp_path: Path) -> None
     assert memory["goal"] == "继续整理上下文"
     assert session["memory_compacted_upto"] > 0
     assert (tmp_path / ".nju_agent" / "memory" / "abc.json").exists()
+
+
+def test_memory_parsers_strip_json_fences(tmp_path: Path) -> None:
+    summary_client = SimpleNamespace(
+        responses=SequencedResponses(
+            [
+                _fenced_json_response(
+                    {
+                        "goal": "整理上下文",
+                        "decisions": ["保留最近 4 轮"],
+                        "important_files": [],
+                        "open_tasks": [],
+                        "user_preferences": [],
+                        "notes": [],
+                    },
+                    id_suffix="summary",
+                )
+            ]
+        )
+    )
+    memory = agent_module._summarize_session_memory(
+        conversation=[{"role": "user", "content": "hello"}],
+        client=summary_client,
+        settings=Settings(api_key="key", model="deepseek-test"),
+    )
+    assert memory["goal"] == "整理上下文"
+
+    update_client = SimpleNamespace(
+        responses=SequencedResponses(
+            [
+                _fenced_json_response(
+                    {
+                        "goal": "继续整理上下文",
+                        "decisions": ["保留最近 8 轮"],
+                        "important_files": [],
+                        "open_tasks": ["继续压缩旧历史"],
+                        "user_preferences": [],
+                        "notes": [],
+                    },
+                    id_suffix="update",
+                )
+            ]
+        )
+    )
+    updated = agent_module._update_session_memory_incrementally(
+        current_memory=agent_module._default_session_memory(),
+        new_conversation_chunk=[{"role": "user", "content": "hello"}],
+        client=update_client,
+        settings=Settings(api_key="key", model="deepseek-test"),
+    )
+    assert updated["goal"] == "继续整理上下文"
 
 
 def test_run_agent_handles_tool_call_then_completion(tmp_path: Path) -> None:
@@ -328,6 +386,7 @@ def test_run_chat_session_undo_reverts_last_write_batch(tmp_path: Path) -> None:
     assert (tmp_path / "hello.txt").read_text(encoding="utf-8") == "old content"
     sessions = json.loads((tmp_path / ".nju_agent" / "sessions.json").read_text(encoding="utf-8"))
     session_id = sessions[0]["id"]
+    assert sessions[0]["message_count"] == 1
     batches_path = tmp_path / ".nju_agent" / "write_batches" / f"{session_id}.json"
     assert batches_path.exists()
     assert json.loads(batches_path.read_text(encoding="utf-8")) == []
@@ -623,6 +682,57 @@ def test_call_tool_cancels_dangerous_command(tmp_path: Path) -> None:
     assert target.exists()
 
 
+def test_dangerous_command_reason_only_checks_command_name() -> None:
+    assert agent_module._dangerous_command_reason(["echo", "rm"]) is None
+    assert agent_module._dangerous_command_reason(["rmdir.py"]) is None
+    assert agent_module._dangerous_command_reason(["git", "status"]) is None
+    assert agent_module._dangerous_command_reason(["git", "clean", "-fd"]) == "git"
+
+
+def test_run_agent_confirms_dangerous_command(tmp_path: Path) -> None:
+    target = tmp_path / "danger.txt"
+    target.write_text("keep", encoding="utf-8")
+    calls: list[dict[str, object]] = []
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return SimpleNamespace(
+                    id="resp-1",
+                    output=[
+                        SimpleNamespace(
+                            type="function_call",
+                            name="run_command",
+                            arguments=json.dumps(
+                                {"command": ["rm", "-f", str(target)]}
+                            ),
+                            call_id="call-1",
+                        )
+                    ],
+                    output_text="",
+                )
+            return SimpleNamespace(id="resp-2", output=[], output_text="done")
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = FakeResponses()
+
+    result = run_agent(
+        "remove file",
+        workspace_root=tmp_path,
+        client=FakeClient(),
+        settings=Settings(api_key="key", model="deepseek-test", max_steps=3),
+        access_mode=ACCESS_WRITE,
+        logger=lambda _: None,
+        confirm_input_fn=lambda _: "yes",
+    )
+
+    assert result == "done"
+    assert not target.exists()
+    assert calls[1]["input"][-1]["type"] == "function_call_output"
+
+
 def test_run_agent_with_subagents_plans_reviews_and_retries(tmp_path: Path) -> None:
     calls: list[dict[str, object]] = []
 
@@ -749,6 +859,50 @@ def test_run_chat_session_rejects_unknown_slash_command_before_model(tmp_path: P
     assert len(responses.calls) == 0
 
 
+def test_run_chat_session_rejects_invalid_access_command_before_model(tmp_path: Path) -> None:
+    responses = SequencedResponses([])
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = responses
+
+    inputs = iter(["/access x", "/exit"])
+    logs: list[str] = []
+
+    run_chat_session(
+        workspace_root=tmp_path,
+        client=FakeClient(),
+        settings=Settings(api_key="key", model="deepseek-test", max_steps=3),
+        logger=logs.append,
+        input_fn=lambda _: next(inputs),
+    )
+
+    assert logs == ["输入无效，请重新选择"]
+    assert len(responses.calls) == 0
+
+
+def test_run_chat_session_rejects_invalid_subagents_command_before_model(tmp_path: Path) -> None:
+    responses = SequencedResponses([])
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = responses
+
+    inputs = iter(["/subagents x", "/exit"])
+    logs: list[str] = []
+
+    run_chat_session(
+        workspace_root=tmp_path,
+        client=FakeClient(),
+        settings=Settings(api_key="key", model="deepseek-test", max_steps=3),
+        logger=logs.append,
+        input_fn=lambda _: next(inputs),
+    )
+
+    assert logs == ["输入无效，请重新选择"]
+    assert len(responses.calls) == 0
+
+
 def test_run_chat_session_default_terminal_ui_emits_final_result(monkeypatch, tmp_path: Path) -> None:
     responses = SequencedResponses(
         [
@@ -803,6 +957,24 @@ def test_run_chat_session_default_terminal_ui_emits_final_result(monkeypatch, tm
     assert any(message.startswith("最终结果：") for message in fake_ui.outputs)
     assert any(message == "最终结果：done" for message in fake_ui.outputs)
     assert any(message.startswith("state:") for message in fake_ui.outputs)
+
+
+def test_fit_visible_conversation_truncates_overlong_single_turn() -> None:
+    visible, token_count = agent_module._fit_visible_conversation(
+        conversation=[{"role": "user", "content": "x" * 5000}],
+        workspace_root=Path("."),
+        settings=Settings(
+            api_key="key",
+            model="deepseek-test",
+            context_token_limit=1,
+            recent_turns=1,
+        ),
+        session_memory=agent_module._default_session_memory(),
+        access_mode=ACCESS_WRITE,
+    )
+
+    assert len(str(visible[0]["content"])) < 5000
+    assert token_count >= 0
 
 
 def test_terminal_ui_pretty_prints_json_tool_result() -> None:

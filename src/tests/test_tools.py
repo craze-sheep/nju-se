@@ -21,6 +21,14 @@ def test_list_files_returns_sorted_names(tmp_path: Path) -> None:
     assert list_files(str(tmp_path)) == ["a.txt", "b.txt"]
 
 
+def test_list_files_keeps_non_blacklisted_dotfiles(tmp_path: Path) -> None:
+    (tmp_path / "visible.txt").write_text("v", encoding="utf-8")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".env").write_text("secret", encoding="utf-8")
+
+    assert list_files(str(tmp_path)) == [".env", "visible.txt"]
+
+
 def test_read_and_write_file(tmp_path: Path) -> None:
     _init_git_repo(tmp_path)
     result = write_file(str(tmp_path), "notes/hello.txt", "hello nju")
@@ -37,6 +45,17 @@ def test_write_file_diff_includes_before_and_after(tmp_path: Path) -> None:
     (tmp_path / "notes" / "hello.txt").write_text("old", encoding="utf-8")
     subprocess.run(["git", "add", "notes/hello.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
     subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    result = write_file(str(tmp_path), "notes/hello.txt", "new")
+
+    assert "-old" in result.diff
+    assert "+new" in result.diff
+
+
+def test_write_file_diff_includes_untracked_existing_file(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    (tmp_path / "notes").mkdir()
+    (tmp_path / "notes" / "hello.txt").write_text("old", encoding="utf-8")
 
     result = write_file(str(tmp_path), "notes/hello.txt", "new")
 
@@ -83,3 +102,13 @@ def test_write_file_uses_git_clean_for_new_files(tmp_path: Path) -> None:
     assert "new file mode" in result.diff or "diff --git" in result.diff
     revert_write_file(str(tmp_path), asdict(result))
     assert not (tmp_path / "new.txt").exists()
+
+
+def test_revert_write_file_prunes_empty_parent_dirs(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+
+    result = write_file(str(tmp_path), "notes/deep/hello.txt", "hello")
+    revert_write_file(str(tmp_path), asdict(result))
+
+    assert not (tmp_path / "notes" / "deep").exists()
+    assert not (tmp_path / "notes").exists()

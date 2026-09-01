@@ -3,7 +3,6 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -46,6 +45,8 @@ REVIEWER_PROMPT = """你是一个 coding agent 的 reviewer。
 
 ACCESS_READ_ONLY = "read_only"
 ACCESS_WRITE = "write"
+ACCESS_COMMANDS = {"/access", "access", "/perm", "perm", "/mode", "mode"}
+SUBAGENTS_COMMANDS = {"/subagents", "subagents", "/roles", "roles"}
 
 SESSION_SUMMARY_PROMPT = """你是一个会话摘要器。请根据下面的完整对话，提炼出简短、结构化、可用于后续记忆更新的摘要。
 
@@ -140,6 +141,13 @@ def _session_subagents_enabled(session: dict[str, Any]) -> bool:
 
 def _set_session_subagents_enabled(session: dict[str, Any], enabled: bool) -> None:
     session["subagents_enabled"] = bool(enabled)
+
+
+def _command_head(user_text: str) -> str:
+    parts = user_text.strip().split()
+    if not parts:
+        return ""
+    return parts[0].lower()
 
 
 def tool_definitions(access_mode: str = ACCESS_READ_ONLY) -> list[dict[str, Any]]:
@@ -449,10 +457,13 @@ def _format_write_batch_diff(batch: dict[str, Any]) -> str:
     for change in changes:
         if not isinstance(change, dict):
             continue
+        before_content = change.get("before_content", None)
         diff = str(change.get("diff", "")).strip()
         relative_path = str(change.get("relative_path", "")).strip()
         if diff:
             parts.append(diff)
+        elif before_content is not None and relative_path:
+            parts.append(f"{relative_path} 已恢复到写前内容")
         elif relative_path:
             parts.append(f"{relative_path} 没有文本差异")
     return "\n\n".join(parts) if parts else "最近一批 write_file 没有记录到文件差异"
@@ -465,17 +476,6 @@ def _last_write_diff(workspace_root: Path, session_id: str) -> str:
     return _format_write_batch_diff(batches[-1])
 
 
-def _can_git_undo_change(change: dict[str, Any]) -> bool:
-    if not isinstance(change, dict):
-        return False
-    relative_path = str(change.get("relative_path", "")).strip()
-    if not relative_path:
-        return False
-    tracked_before = bool(change.get("tracked_before", False))
-    existed_before = bool(change.get("existed_before", False))
-    return tracked_before or not existed_before
-
-
 def _undo_last_write_batch(workspace_root: Path, session_id: str) -> str:
     batches = _load_write_batches(workspace_root, session_id)
     if not batches:
@@ -485,14 +485,6 @@ def _undo_last_write_batch(workspace_root: Path, session_id: str) -> str:
     changes = batch.get("changes", [])
     if not isinstance(changes, list) or not changes:
         return "最近一批 write_file 没有可撤销的文件"
-
-    unsupported = [
-        str(change.get("relative_path", "")).strip()
-        for change in changes
-        if isinstance(change, dict) and not _can_git_undo_change(change)
-    ]
-    if unsupported:
-        return f"最近一批 write_file 里有 Git 无法直接撤销的文件：{', '.join(filter(None, unsupported))}"
 
     try:
         for change in reversed(changes):
@@ -541,6 +533,19 @@ def _normalize_session_memory(data: Any) -> dict[str, Any]:
     return base
 
 
+def _strip_prompt_fences(text: str) -> str:
+    cleaned = text.strip()
+    if not cleaned.startswith("```"):
+        return cleaned
+    lines = cleaned.splitlines()
+    if len(lines) >= 2 and lines[-1].strip().startswith("```"):
+        inner = lines[1:-1]
+        if inner and inner[0].strip().lower().startswith("json"):
+            inner = inner[1:]
+        return "\n".join(inner).strip()
+    return cleaned
+
+
 def _session_memory_markdown(memory: dict[str, Any]) -> str:
     lines = ["# Session Memory", ""]
     goal = str(memory.get("goal", "")).strip()
@@ -560,6 +565,22 @@ def _session_memory_markdown(memory: dict[str, Any]) -> str:
             lines.append("- （空）")
         lines.append("")
     return "\n".join(lines).strip()
+
+
+def _count_user_assistant_messages(conversation: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for item in conversation
+        if str(item.get("role", "")).strip() in {"user", "assistant"}
+    )
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
 
 
 def _global_memory_markdown(workspace_root: Path) -> str:
@@ -782,6 +803,7 @@ def _parse_reviewer_result(text: str) -> dict[str, Any]:
         "needs_retry": False,
         "retry_advice": "",
     }
+    text = _strip_prompt_fences(text)
     if not text.strip():
         return default
     try:
@@ -840,6 +862,71 @@ def _review_task_result(
     return _parse_reviewer_result((getattr(response, "output_text", "") or "").strip())
 
 
+def _trim_overlong_visible_conversation(
+    visible: list[dict[str, Any]],
+    *,
+    workspace_root: Path,
+    settings: Settings,
+    session_memory: dict[str, Any],
+    access_mode: str,
+    task_plan: str = "",
+    reviewer_feedback: str = "",
+) -> tuple[list[dict[str, Any]], int] | None:
+    trimmed = deepcopy(visible)
+    instructions = _build_instructions(
+        workspace_root=workspace_root,
+        session_memory=session_memory,
+        access_mode=access_mode,
+        task_plan=task_plan,
+        reviewer_feedback=reviewer_feedback,
+    )
+
+    def _payload_tokens() -> int:
+        return _count_payload_tokens(
+            instructions=instructions,
+            conversation=trimmed,
+            tools=tool_definitions(access_mode),
+            model=settings.model,
+        )
+
+    token_count = _payload_tokens()
+    if token_count <= settings.context_token_limit:
+        return trimmed, token_count
+
+    for _ in range(24):
+        candidates: list[tuple[int, str, int]] = []
+        for index, item in enumerate(trimmed):
+            item_type = str(item.get("type", "")).strip()
+            role = str(item.get("role", "")).strip()
+            if item_type == "function_call_output":
+                text = str(item.get("output", ""))
+                candidates.append((index, "output", len(text)))
+            elif role in {"user", "assistant"}:
+                text = str(item.get("content", ""))
+                candidates.append((index, "content", len(text)))
+            elif item_type == "function_call":
+                text = str(item.get("arguments", ""))
+                candidates.append((index, "arguments", len(text)))
+        if not candidates:
+            break
+
+        index, field, length = max(candidates, key=lambda item: item[2])
+        current = str(trimmed[index].get(field, ""))
+        if not current:
+            break
+        if length <= 32:
+            trimmed[index][field] = "[已截断]"
+        else:
+            trimmed[index][field] = _truncate_text(current, max(32, len(current) // 2))
+
+        token_count = _payload_tokens()
+        if token_count <= settings.context_token_limit:
+            return trimmed, token_count
+
+    token_count = _payload_tokens()
+    return trimmed, token_count
+
+
 def _fit_visible_conversation(
     *,
     conversation: list[dict[str, Any]],
@@ -871,6 +958,17 @@ def _fit_visible_conversation(
             model=settings.model,
         )
         if token_count <= settings.context_token_limit or turns == 1:
+            if token_count > settings.context_token_limit and visible:
+                trimmed = _trim_overlong_visible_conversation(
+                    visible,
+                    workspace_root=workspace_root,
+                    settings=settings,
+                    session_memory=session_memory,
+                    access_mode=access_mode,
+                    task_plan=task_plan,
+                    reviewer_feedback=reviewer_feedback,
+                )
+                return trimmed
             return visible, token_count
 
     return list(conversation), _count_payload_tokens(
@@ -898,7 +996,7 @@ def _summarize_session_memory(
         tools=[],
         instructions=SESSION_SUMMARY_PROMPT,
     )
-    text = getattr(response, "output_text", "") or ""
+    text = _strip_prompt_fences(getattr(response, "output_text", "") or "")
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
@@ -932,7 +1030,7 @@ def _update_session_memory_incrementally(
         tools=[],
         instructions=SESSION_MEMORY_UPDATE_PROMPT,
     )
-    text = getattr(response, "output_text", "") or ""
+    text = _strip_prompt_fences(getattr(response, "output_text", "") or "")
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
@@ -1046,36 +1144,6 @@ def _session_label(session: dict[str, Any]) -> str:
     if session_id:
         return session_id
     return "未命名会话"
-
-
-def _emit_conversation_history(
-    conversation: list[dict[str, Any]],
-    logger: Callable[[str], None],
-) -> None:
-    emit = logger or (lambda _: None)
-    if not conversation:
-        return
-
-    emit("历史消息：")
-    for item in conversation:
-        item_type = str(item.get("type", "")).strip()
-        role = str(item.get("role", "")).strip()
-        if item_type == "function_call":
-            content = f"{item.get('name', '')} {item.get('arguments', '')}".strip()
-            if content:
-                emit(f"工具调用：{content}")
-        elif item_type == "function_call_output":
-            content = str(item.get("output", "")).strip()
-            if content:
-                emit(f"工具结果：{content}")
-        else:
-            content = str(item.get("content", "")).strip()
-            if not content:
-                continue
-            if role == "user":
-                emit(f"你：{content}")
-            elif role == "assistant":
-                emit(f"助手：{content}")
 
 
 def _derive_session_title(text: str) -> str:
@@ -1199,7 +1267,7 @@ def _parse_subagents_command(user_text: str, current_state: bool) -> bool | None
         return None
 
     command = parts[0].lower()
-    if command not in {"/subagents", "subagents", "/roles", "roles"}:
+    if command not in SUBAGENTS_COMMANDS:
         return None
 
     if len(parts) == 1:
@@ -1215,38 +1283,42 @@ def _parse_subagents_command(user_text: str, current_state: bool) -> bool | None
     return None
 
 
+def _parse_access_command(user_text: str) -> str | None:
+    parts = user_text.strip().split()
+    if not parts:
+        return None
+
+    command = parts[0].lower()
+    if command not in ACCESS_COMMANDS:
+        return None
+
+    if len(parts) == 1:
+        return None
+
+    option = parts[1].strip().lower()
+    if option in {"1", "read", "readonly", "read-only", "只读"}:
+        return ACCESS_READ_ONLY
+    if option in {"2", "write", "writable", "可写"}:
+        return ACCESS_WRITE
+    return None
+
+
 def _dangerous_command_reason(command: list[str]) -> str | None:
     if not command:
         return None
 
-    text = " ".join(str(part) for part in command).lower()
-    patterns = [
-        (r"(?<!\w)rm(?!\w)", "rm"),
-        (r"(?<!\w)rmdir(?!\w)", "rmdir"),
-        (r"(?<!\w)unlink(?!\w)", "unlink"),
-        (r"(?<!\w)shred(?!\w)", "shred"),
-        (r"(?<!\w)dd(?!\w)", "dd"),
-        (r"(?<!\w)mkfs\w*(?!\w)", "mkfs"),
-        (r"(?<!\w)killall(?!\w)", "killall"),
-        (r"(?<!\w)pkill(?!\w)", "pkill"),
-        (r"(?<!\w)kill(?!\w)", "kill"),
-        (r"(?<!\w)chmod(?!\w)", "chmod"),
-        (r"(?<!\w)chown(?!\w)", "chown"),
-        (r"git\s+(clean|reset|restore|checkout)\b", "git"),
-    ]
-    for pattern, label in patterns:
-        if re.search(pattern, text):
-            return label
+    command_name = Path(str(command[0])).name.lower()
+    if command_name in {"rm", "rmdir", "unlink", "shred", "dd", "killall", "pkill", "kill", "chmod", "chown"}:
+        return command_name
+    if command_name.startswith("mkfs"):
+        return "mkfs"
+    if command_name == "git" and len(command) > 1 and command[1] in {"clean", "reset", "restore", "checkout"}:
+        return "git"
     return None
 
 
-def _is_known_slash_command(user_text: str) -> bool:
-    parts = user_text.strip().split()
-    if not parts:
-        return False
-
-    command = parts[0].lower()
-    return command in {
+def _known_slash_command_heads() -> set[str]:
+    return {
         "/exit",
         "exit",
         "quit",
@@ -1276,6 +1348,15 @@ def _is_known_slash_command(user_text: str) -> bool:
     }
 
 
+def _is_known_slash_command(user_text: str) -> bool:
+    parts = user_text.strip().split()
+    if not parts:
+        return False
+
+    command = parts[0].lower()
+    return command in _known_slash_command_heads()
+
+
 def _sync_session_state(
     *,
     sessions_index_path: Path,
@@ -1299,7 +1380,7 @@ def _sync_session_state(
         return sessions
 
     active_session["updated_at"] = time.time()
-    active_session["message_count"] = len(conversation)
+    active_session["message_count"] = _count_user_assistant_messages(conversation)
     sessions = _update_session_index(sessions, active_session)
     _save_sessions_index(sessions_index_path, sessions)
     return sessions
@@ -1368,7 +1449,7 @@ def _call_tool(
     workspace_root: Path,
     access_mode: str,
     write_changes: list[dict[str, Any]] | None = None,
-    confirm_input_fn: Callable[[str], str] | None = None,
+    confirm_input_fn: Callable[[str], str] | None = input,
     ui: TerminalUI | None = None,
 ) -> str:
     root = str(workspace_root)
@@ -1386,6 +1467,7 @@ def _call_tool(
                 "relative_path": result.relative_path,
                 "existed_before": result.existed_before,
                 "tracked_before": result.tracked_before,
+                "before_content": result.before_content,
                 "diff": result.diff,
             }
             if write_changes is not None:
@@ -1406,15 +1488,16 @@ def _call_tool(
                 return "错误：run_command 的 command 参数必须是字符串数组"
             reason = _dangerous_command_reason(command)
             if reason is not None:
-                if confirm_input_fn is None:
-                    return f"错误：检测到危险命令（{reason}），当前会话没有确认入口"
                 prompt = (
                     f"[bold red]危险命令[/bold red]：{reason} -> [bold]{' '.join(command)}[/bold]\n"
                     "输入 [bold]yes[/bold] 继续，其他内容取消："
                     if ui is not None
                     else f"危险命令：{reason} -> {' '.join(command)}\n输入 yes 继续，其他内容取消："
                 )
-                answer = confirm_input_fn(prompt).strip().lower()
+                try:
+                    answer = (confirm_input_fn or input)(prompt).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    return f"已取消执行危险命令：{' '.join(command)}"
                 if answer not in {"y", "yes", "是", "确认", "继续", "ok", "okay"}:
                     return f"已取消执行危险命令：{' '.join(command)}"
             result = run_command(
@@ -1667,6 +1750,7 @@ def run_agent(
     access_mode: str = ACCESS_READ_ONLY,
     subagents_enabled: bool = False,
     logger: Callable[[str], None] | None = print,
+    confirm_input_fn: Callable[[str], str] | None = None,
 ) -> str:
     settings = settings or load_settings()
     client = client or build_client(settings)
@@ -1683,6 +1767,7 @@ def run_agent(
         subagents_enabled=subagents_enabled,
         write_changes=write_changes,
         logger=logger,
+        confirm_input_fn=confirm_input_fn,
     )
 
 
@@ -1716,7 +1801,7 @@ def run_chat_session(
         conversation = _load_conversation(legacy_conversation_path)
         if conversation:
             active_session = _create_session_record("迁移会话")
-            active_session["message_count"] = len(conversation)
+            active_session["message_count"] = _count_user_assistant_messages(conversation)
             _save_conversation(_session_path(workspace_root, active_session["id"]), conversation)
             sessions = [active_session]
             _save_sessions_index(sessions_index_path, sessions)
@@ -1852,14 +1937,22 @@ def run_chat_session(
         if user_text in {"/undo", "undo"}:
             emit(_undo_last_write_batch(workspace_root, str(active_session["id"])))
             continue
-        if user_text in {"/access", "access", "/perm", "perm", "/mode", "mode"}:
-            selected_mode = _choose_access_mode(
-                read_input,
-                emit,
-                prompt_style=terminal_ui is not None,
-            )
-            if selected_mode is None:
-                continue
+        command_head = _command_head(user_text)
+        if command_head in ACCESS_COMMANDS:
+            parts = user_text.strip().split()
+            if len(parts) == 1:
+                selected_mode = _choose_access_mode(
+                    read_input,
+                    emit,
+                    prompt_style=terminal_ui is not None,
+                )
+                if selected_mode is None:
+                    continue
+            else:
+                selected_mode = _parse_access_command(user_text)
+                if selected_mode is None:
+                    emit("输入无效，请重新选择")
+                    continue
             _set_session_access_mode(active_session, selected_mode)
             sessions = _sync_session_state(
                 sessions_index_path=sessions_index_path,
@@ -1875,11 +1968,14 @@ def run_chat_session(
                     subagents_enabled=_session_subagents_enabled(active_session),
                 )
             continue
-        next_subagents_state = _parse_subagents_command(
-            user_text,
-            _session_subagents_enabled(active_session),
-        )
-        if next_subagents_state is not None:
+        if command_head in SUBAGENTS_COMMANDS:
+            next_subagents_state = _parse_subagents_command(
+                user_text,
+                _session_subagents_enabled(active_session),
+            )
+            if next_subagents_state is None:
+                emit("输入无效，请重新选择")
+                continue
             _set_session_subagents_enabled(active_session, next_subagents_state)
             sessions = _sync_session_state(
                 sessions_index_path=sessions_index_path,
@@ -1895,7 +1991,7 @@ def run_chat_session(
                     subagents_enabled=_session_subagents_enabled(active_session),
                 )
             continue
-        if user_text.startswith("/") and not _is_known_slash_command(user_text):
+        if user_text.startswith("/") and command_head not in _known_slash_command_heads():
             emit(f"错误：没有这个功能：{user_text.split()[0]}")
             continue
         if user_text in {"/reset", "reset"}:
@@ -1970,15 +2066,13 @@ def run_chat_session(
                 else _default_session_memory()
             )
             if existing_session:
-                active_session["message_count"] = len(conversation)
+                active_session["message_count"] = _count_user_assistant_messages(conversation)
                 if terminal_ui is not None:
                     terminal_ui.render_conversation_history(conversation)
                     terminal_ui.render_state(
                         access_mode=_access_mode_label(_session_access_mode(active_session)),
                         subagents_enabled=_session_subagents_enabled(active_session),
                     )
-                else:
-                    _emit_conversation_history(conversation, emit)
             continue
 
         if _should_title_from_first_message(active_session):
