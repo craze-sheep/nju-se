@@ -34,7 +34,7 @@ class TerminalUI:
         info.add_row("工作区", str(workspace_root))
         info.add_row("模型", model)
         info.add_row("命令", "/access  /subagents  /diff  /undo  /choose  /reset  /exit")
-        info.add_row("提示", "输入 /exit 退出，/reset 清空历史，/choose 选择对话，/access 切换权限")
+        info.add_row("提示", "输入 /exit 退出，/reset 清空历史，/choose 选择对话，/access 直接切换权限")
 
         self.console.print(
             Panel(
@@ -149,7 +149,7 @@ class TerminalUI:
         if not text:
             return
 
-        if text in {"可用会话：", "权限选项："}:
+        if text == "可用会话：":
             self.console.print(Rule(text, style="cyan"))
             return
 

@@ -1255,34 +1255,6 @@ def _choose_session(
         emit("输入无效，请重新选择")
 
 
-def _choose_access_mode(
-    input_fn: Callable[[str], str],
-    logger: Callable[[str], None],
-    *,
-    prompt_style: bool = False,
-) -> str | None:
-    emit = logger or (lambda _: None)
-    emit("权限选项：")
-    emit("1. 只读")
-    emit("2. 可写")
-    emit("b. 返回")
-
-    while True:
-        prompt = (
-            "[bold cyan]选择权限编号[/bold cyan]，或输入 [bold]b[/bold] 返回："
-            if prompt_style
-            else "选择权限编号，或输入 b 返回："
-        )
-        choice = input_fn(prompt).strip().lower()
-        if choice in {"b", "back"}:
-            return None
-        if choice == "1":
-            return ACCESS_READ_ONLY
-        if choice == "2":
-            return ACCESS_WRITE
-        emit("输入无效，请重新选择")
-
-
 def _parse_subagents_command(user_text: str, current_state: bool) -> bool | None:
     parts = user_text.strip().split()
     if not parts:
@@ -1305,24 +1277,8 @@ def _parse_subagents_command(user_text: str, current_state: bool) -> bool | None
     return None
 
 
-def _parse_access_command(user_text: str) -> str | None:
-    parts = user_text.strip().split()
-    if not parts:
-        return None
-
-    command = parts[0].lower()
-    if command not in ACCESS_COMMANDS:
-        return None
-
-    if len(parts) == 1:
-        return None
-
-    option = parts[1].strip().lower()
-    if option in {"1", "read", "readonly", "read-only", "只读"}:
-        return ACCESS_READ_ONLY
-    if option in {"2", "write", "writable", "可写"}:
-        return ACCESS_WRITE
-    return None
+def _toggle_access_mode(current_mode: str) -> str:
+    return ACCESS_WRITE if _normalize_access_mode(current_mode) == ACCESS_READ_ONLY else ACCESS_READ_ONLY
 
 
 def _dangerous_command_reason(command: list[str]) -> str | None:
@@ -1969,19 +1925,10 @@ def run_chat_session(
         command_head = _command_head(user_text)
         if command_head in ACCESS_COMMANDS:
             parts = user_text.strip().split()
-            if len(parts) == 1:
-                selected_mode = _choose_access_mode(
-                    read_input,
-                    emit,
-                    prompt_style=terminal_ui is not None,
-                )
-                if selected_mode is None:
-                    continue
-            else:
-                selected_mode = _parse_access_command(user_text)
-                if selected_mode is None:
-                    emit("输入无效，请重新选择")
-                    continue
+            if len(parts) != 1:
+                emit("输入无效，请直接输入 /access 切换权限")
+                continue
+            selected_mode = _toggle_access_mode(_session_access_mode(active_session))
             _set_session_access_mode(active_session, selected_mode)
             sessions = _sync_session_state(
                 sessions_index_path=sessions_index_path,

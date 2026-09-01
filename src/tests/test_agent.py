@@ -373,7 +373,7 @@ def test_run_chat_session_undo_reverts_last_write_batch(tmp_path: Path) -> None:
     (tmp_path / "hello.txt").write_text("old content", encoding="utf-8")
     subprocess.run(["git", "add", "hello.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
     subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
-    inputs = iter(["/access", "2", "make change", "/undo", "/exit"])
+    inputs = iter(["/access", "make change", "/undo", "/exit"])
 
     run_chat_session(
         workspace_root=tmp_path,
@@ -390,6 +390,35 @@ def test_run_chat_session_undo_reverts_last_write_batch(tmp_path: Path) -> None:
     batches_path = tmp_path / ".nju_agent" / "write_batches" / f"{session_id}.json"
     assert batches_path.exists()
     assert json.loads(batches_path.read_text(encoding="utf-8")) == []
+
+
+def test_run_chat_session_access_toggles_without_menu(tmp_path: Path) -> None:
+    responses = SequencedResponses(
+        [
+            _empty_response("done"),
+            _summary_response(),
+            _global_memory_response(),
+        ]
+    )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = responses
+
+    inputs = iter(["/access", "/exit"])
+    logs: list[str] = []
+
+    run_chat_session(
+        workspace_root=tmp_path,
+        client=FakeClient(),
+        settings=Settings(api_key="key", model="deepseek-test", max_steps=3),
+        logger=logs.append,
+        input_fn=lambda _: next(inputs),
+    )
+
+    assert "当前权限已切换为：可写" in logs
+    sessions = json.loads((tmp_path / ".nju_agent" / "sessions.json").read_text(encoding="utf-8"))
+    assert sessions[0]["access_mode"] == "write"
 
 
 def test_run_chat_session_starts_new_session_by_default(tmp_path: Path) -> None:
@@ -892,7 +921,7 @@ def test_run_chat_session_rejects_invalid_access_command_before_model(tmp_path: 
         input_fn=lambda _: next(inputs),
     )
 
-    assert logs == ["输入无效，请重新选择"]
+    assert logs == ["输入无效，请直接输入 /access 切换权限"]
     assert len(responses.calls) == 0
 
 

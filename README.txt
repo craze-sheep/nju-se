@@ -15,7 +15,7 @@ Semacode Agent（思码智能体）：以语义建模为内核的 coding agent�
 - 权限控制：默认是只读；用户可以用 `/access` 切到可写。只读时开放 `search` / `list_files` / `read_file`，不会让模型直接修改内容。
 - Git 集成：`write_file` 会记录 diff，用户可以用 `/diff` 看最近一次改了什么，用 `/undo` 撤销最近一批写入。
 - 轻量分工：用户可以用 `/subagents` 打开 planner / reviewer。planner 先把任务拆清楚，reviewer 再检查结果，真正动手的还是 executor。
-- 本地执行：`run_command` 直接在当前工作区里执行命令，遇到危险命令会先确认再跑。
+- 本地执行：`run_command` 直接在当前工作区里执行命令，遇到危险命令会先征求用户确认再跑。
 - 错误处理：工具失败时不会让整个程序崩掉，而是把错误信息返回给模型继续处理。
 
 这个版本的核心特点是：所有关键逻辑都在本地实现，模型只负责“想下一步做什么”，不负责直接碰文件或执行命令。
@@ -24,8 +24,3 @@ Semacode Agent（思码智能体）：以语义建模为内核的 coding agent�
 1. 设置环境变量 `DEEPSEEK_API_KEY`
 2. 在仓库根目录执行：`PYTHONPATH=src/src python -m nju_agent`
 3. 运行测试：`PYTHONPATH=src/src pytest src/tests -q`
-
-补充说明：
-- API key 只通过环境变量提供，不写入仓库、README.txt 或视频
-- `run_command` 默认本地执行；危险命令会在执行前要求确认
-- 小任务优先使用 `search` 定位相关文件，再读取少量命中文件，减少无关输出
