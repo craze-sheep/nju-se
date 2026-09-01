@@ -713,17 +713,19 @@ def test_call_tool_search_returns_matches(tmp_path: Path) -> None:
 def test_call_tool_cancels_dangerous_command(tmp_path: Path) -> None:
     target = tmp_path / "danger.txt"
     target.write_text("keep", encoding="utf-8")
+    prompts: list[str] = []
 
     result = agent_module._call_tool(
         "run_command",
         {"command": ["rm", "-rf", str(target)]},
         tmp_path,
         ACCESS_WRITE,
-        confirm_input_fn=lambda prompt: "no",
+        confirm_input_fn=lambda prompt: prompts.append(prompt) or "no",
     )
 
     assert result.startswith("已取消执行危险命令：")
     assert target.exists()
+    assert any("Y/N" in prompt for prompt in prompts)
 
 
 def test_dangerous_command_reason_only_checks_command_name() -> None:
@@ -1056,6 +1058,18 @@ def test_terminal_ui_state_is_separate_from_banner() -> None:
     text = console.export_text(clear=False)
     assert "编辑权限" in text
     assert "subagents" in text
+
+
+def test_terminal_ui_renders_danger_confirmation_messages() -> None:
+    console = Console(record=True, width=100)
+    ui = TerminalUI(console=console)
+
+    ui.emit("危险命令：rm -> rm game_show/README.md")
+    ui.emit("确认执行：请输入 Y 或 N，N 表示取消。")
+
+    text = console.export_text(clear=False)
+    assert "危险命令：rm -> rm game_show/README.md" in text
+    assert "确认执行：请输入 Y 或 N" in text
 
 
 def test_terminal_ui_panels_use_full_width() -> None:

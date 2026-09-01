@@ -1,0 +1,22 @@
+- generic [ref=e2]:
+  - banner [ref=e3]:
+    - heading "2048" [level=1] [ref=e4]
+    - generic [ref=e5]:
+      - generic [ref=e6]:
+        - generic [ref=e7]: 得分
+        - text: "0"
+      - generic [ref=e8]:
+        - generic [ref=e9]: 最高分
+        - text: "0"
+  - generic [ref=e10]:
+    - paragraph [ref=e11]: 方向键 / WASD 操控
+    - button "新游戏" [ref=e12] [cursor=pointer]
+  - generic [ref=e13]:
+    - generic [ref=e31]:
+      - generic [ref=e32]: "2"
+      - generic [ref=e33]: "2"
+    - generic:
+      - generic:
+        - paragraph
+        - button "再来一局"
+  - paragraph [ref=e34]: 合成 2048 即获胜；棋盘填满且无相邻相同方块时游戏结束。

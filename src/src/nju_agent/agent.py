@@ -1473,18 +1473,20 @@ def _call_tool(
                 return "错误：run_command 的 command 参数必须是字符串数组"
             reason = _dangerous_command_reason(command)
             if reason is not None:
-                prompt = (
-                    f"[bold red]危险命令[/bold red]：{reason} -> [bold]{' '.join(command)}[/bold]\n"
-                    "输入 [bold]yes[/bold] 继续，其他内容取消："
-                    if ui is not None
-                    else f"危险命令：{reason} -> {' '.join(command)}\n输入 yes 继续，其他内容取消："
-                )
+                command_text = " ".join(command)
+                warning_text = f"危险命令：{reason} -> {command_text}"
+                if ui is not None:
+                    ui.emit(warning_text)
+                    ui.emit("确认执行：请输入 Y 或 N，N 表示取消。")
+                    prompt = "Y/N："
+                else:
+                    prompt = f"{warning_text}\n确认执行：请输入 Y 或 N，N 表示取消。\nY/N："
                 try:
                     answer = (confirm_input_fn or input)(prompt).strip().lower()
                 except (EOFError, KeyboardInterrupt):
-                    return f"已取消执行危险命令：{' '.join(command)}"
+                    return f"已取消执行危险命令：{command_text}"
                 if answer not in {"y", "yes", "是", "确认", "继续", "ok", "okay"}:
-                    return f"已取消执行危险命令：{' '.join(command)}"
+                    return f"已取消执行危险命令：{command_text}"
             result = run_command(
                 root,
                 command,
@@ -1537,7 +1539,7 @@ def _run_conversation(
             task_plan=task_plan,
             reviewer_feedback=reviewer_feedback,
         )
-        request_context = ui.status("SimaAgent正在思考") if ui is not None else nullcontext()
+        request_context = ui.status("SeemaAgent正在思考") if ui is not None else nullcontext()
         with request_context:
             response = request_response(
                 client,

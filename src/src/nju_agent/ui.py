@@ -34,7 +34,7 @@ class TerminalUI:
         info.add_row("工作区", str(workspace_root))
         info.add_row("模型", model)
         info.add_row("命令", "/access  /subagents  /diff  /undo  /choose  /reset  /exit")
-        info.add_row("提示", "输入 /exit 退出，/reset 清空历史，/choose 选择对话，/access 直接切换权限")
+        info.add_row("提示", "输入 /exit 退出，/reset 清空历史，/choose 选择对话，/access 切换权限")
 
         self.console.print(
             Panel(
@@ -171,6 +171,12 @@ class TerminalUI:
             return
         if label == "审查建议重试":
             self._render_markdown_panel("审查建议重试", content, "yellow")
+            return
+        if label == "危险命令":
+            self.console.print(Text(f"{label}：{content}", style="bold red"))
+            return
+        if label == "确认执行":
+            self.console.print(Text(f"{label}：{content}", style="red"))
             return
         if label == "最终结果":
             self._render_markdown_panel("最终结果", content, "green", bold=True)
