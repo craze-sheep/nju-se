@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>2048</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #faf8ef;
+    font-family: "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: #776e65;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    min-height: 100vh;
+    padding: 24px 12px;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+  }
+  .container { width: 100%; max-width: 520px; }
+  .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+  h1 { font-size: 52px; font-weight: 900; color: #776e65; line-height: 1; }
+  .scores { display: flex; gap: 8px; }
+  .score-box {
+    background: #bbada0; color: #eee4da; border-radius: 6px;
+    padding: 6px 14px; text-align: center; min-width: 78px;
+  }
+  .score-box .label { display: block; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+  .score-box .value { font-size: 22px; font-weight: 700; color: #fff; }
+  .controls { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+  .controls p { font-size: 13px; color: #a39a92; }
+  .btn {
+    background: #8f7a66; color: #f9f6f2; border: none; border-radius: 6px;
+    padding: 10px 18px; font-size: 15px; font-weight: 700; cursor: pointer;
+    transition: background 120ms;
+  }
+  .btn:hover { background: #9f8b77; }
+  .board {
+    position: relative;
+    width: 480px; height: 480px;
+    max-width: 100%;
+    background: #bbada0;
+    border-radius: 10px;
+    touch-action: none;
+  }
+  .grid-cells, .tile-layer { position: absolute; inset: 12px; }
+  .grid-cells { display: grid; grid-template-columns: repeat(4, 1fr); grid-template-rows: repeat(4, 1fr); gap: 12px; }
+  .grid-cell { background: rgba(238, 228, 218, 0.35); border-radius: 6px; }
+  .tile {
+    position: absolute;
+    width: 105px; height: 105px;
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 55px; font-weight: 800;
+    transition: transform 120ms ease-in-out;
+    will-change: transform;
+    z-index: 5;
+  }
+  .tile-2    { background: #eee4da; color: #776e65; }
+  .tile-4    { background: #ede0c8; color: #776e65; }
+  .tile-8    { background: #f2b179; color: #f9f6f2; }
+  .tile-16   { background: #f59563; color: #f9f6f2; }
+  .tile-32   { background: #f67c5f; color: #f9f6f2; }
+  .tile-64   { background: #f65e3b; color: #f9f6f2; }
+  .tile-128  { background: #edcf72; color: #f9f6f2; font-size: 45px; }
+  .tile-256  { background: #edcc61; color: #f9f6f2; font-size: 45px; }
+  .tile-512  { background: #edc850; color: #f9f6f2; font-size: 38px; }
+  .tile-1024 { background: #edc53f; color: #f9f6f2; font-size: 34px; }
+  .tile-2048 { background: #edc22e; color: #f9f6f2; font-size: 34px; }
+  .tile-super { background: #3c3a32; color: #f9f6f2; font-size: 30px; }
+  .tile.pop { animation: pop 180ms ease; }
+  @keyframes pop {
+    0%   { transform: scale(0.6); }
+    100% { transform: scale(1); }
+  }
+  .overlay {
+    position: absolute; inset: 0; z-index: 20;
+    background: rgba(238, 228, 218, 0.73);
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    transition: opacity 200ms;
+  }
+  .overlay.hidden { opacity: 0; pointer-events: none; }
+  .overlay-box { text-align: center; }
+  .overlay-box p { font-size: 34px; font-weight: 900; color: #776e65; margin-bottom: 18px; }
+  .hint { margin-top: 14px; text-align: center; font-size: 13px; color: #a39a92; }
+  @media (max-width: 540px) {
+    .container { transform: scale(0.88); transform-origin: top center; }
+    body { padding: 16px 8px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>2048</h1>
+    <div class="scores">
+      <div class="score-box"><span class="label">得分</span><span class="value" id="score">0</span></div>
+      <div class="score-box"><span class="label">最高</span><span class="value" id="best">0</span></div>
+    </div>
+  </div>
+  <div class="controls">
+    <p>方向键 / WASD 移动，手机可滑动</p>
+    <button class="btn" id="btn-new">新游戏</button>
+  </div>
+  <div class="board" id="board">
+    <div class="grid-cells" id="grid-cells"></div>
+    <div class="tile-layer" id="tile-layer"></div>
+    <div class="overlay hidden" id="overlay">
+      <div class="overlay-box">
+        <p id="overlay-text">游戏结束</p>
+        <button class="btn" id="btn-again">再来一局</button>
+      </div>
+    </div>
+  </div>
+  <p class="hint">合成 2048 即获胜；棋盘填满且无法合并时游戏结束。</p>
+</div>
+
+<script>
+"use strict";
+
+// ============================================================
+// 核心逻辑（纯函数，不依赖 DOM，可被 node 单元测试）
+// ============================================================
+var SIZE = 4;
+var WIN_TILE = 2048;
+var FOUR_PROB = 0.1;   // 新方块为 4 的概率
+
+function makeGrid() {
+  var g = [];
+  for (var r = 0; r < SIZE; r++) {
+    g.push([]);
+    for (var c = 0; c < SIZE; c++) g[r].push(0);
+  }
+  return g;
+}
+
+function emptyCells(grid) {
+  var cells = [];
+  for (var r = 0; r < SIZE; r++) {
+    for (var c = 0; c < SIZE; c++) {
+      if (grid[r][c] === 0) cells.push({ r: r, c: c });
+    }
+  }
+  return cells;
+}
+
+function addRandomTile(grid) {
+  var cells = emptyCells(grid);
+  if (cells.length === 0) return null;
+  var pick = cells[Math.floor(Math.random() * cells.length)];
+  grid[pick.r][pick.c] = Math.random() < FOUR_PROB ? 4 : 2;
+  return { r: pick.r, c: pick.c, value: grid[pick.r][pick.c] };
+}
+
+// 方向 offset 对应的棋盘坐标（offset 0 为移动方向的起点）
+function posAt(direction, lineIdx, offset) {
+  switch (direction) {
+    case "left":  return { r: lineIdx, c: offset };
+    case "right": return { r: lineIdx, c: SIZE - 1 - offset };
+    case "up":    return { r: offset, c: lineIdx };
+    case "down":  return { r: SIZE - 1 - offset, c: lineIdx };
+  }
+  return null;
+}
+
+// 按移动方向取出该条线上的非零格子
+function collectLine(grid, direction, lineIdx) {
+  var cells = [];
+  for (var i = 0; i < SIZE; i++) {
+    var p = posAt(direction, lineIdx, i);
+    if (grid[p.r][p.c] !== 0) cells.push({ r: p.r, c: p.c, value: grid[p.r][p.c] });
+  }
+  return cells;
+}
+
+// 执行一次移动。返回 { grid, moves, gained, moved }
+// moves: 每个格子的移动轨迹 { from:{r,c}, to:{r,c}, value, merged }
+function move(grid, direction) {
+  var result = makeGrid();
+  var moves = [];
+  var gained = 0;
+  var moved = false;
+
+  for (var lineIdx = 0; lineIdx < SIZE; lineIdx++) {
+    var cells = collectLine(grid, direction, lineIdx);
+    var target = 0;
+    for (var i = 0; i < cells.length; i++) {
+      var cell = cells[i];
+      var value = cell.value;
+      var merged = false;
+      if (i + 1 < cells.length && cell.value === cells[i + 1].value) {
+        value = cell.value * 2;
+        merged = true;
+        gained += value;
+        i++; // 跳过被合并的相邻格
+      }
+      var to = posAt(direction, lineIdx, target);
+      result[to.r][to.c] = value;
+      if (to.r !== cell.r || to.c !== cell.c) moved = true;
+      moves.push({ from: { r: cell.r, c: cell.c }, to: to, value: value, merged: merged });
+      target++;
+    }
+  }
+  return { grid: result, moves: moves, gained: gained, moved: moved };
+}
+
+function canMove(grid) {
+  for (var r = 0; r < SIZE; r++) {
+    for (var c = 0; c < SIZE; c++) {
+      if (grid[r][c] === 0) return true;
+      if (r + 1 < SIZE && grid[r][c] === grid[r + 1][c]) return true;
+      if (c + 1 < SIZE && grid[r][c] === grid[r][c + 1]) return true;
+    }
+  }
+  return false;
+}
+
+function maxTile(grid) {
+  var m = 0;
+  for (var r = 0; r < SIZE; r++) {
+    for (var c = 0; c < SIZE; c++) {
+      if (grid[r][c] > m) m = grid[r][c];
+    }
+  }
+  return m;
+}
+
+// ============================================================
+// DOM / 交互（浏览器环境）
+// ============================================================
+if (typeof document !== "undefined") {
+  var boardEl = document.getElementById("board");
+  var gridCellsEl = document.getElementById("grid-cells");
+  var tileLayerEl = document.getElementById("tile-layer");
+  var scoreEl = document.getElementById("score");
+  var bestEl = document.getElementById("best");
+  var overlayEl = document.getElementById("overlay");
+  var overlayTextEl = document.getElementById("overlay-text");
+  var btnNewEl = document.getElementById("btn-new");
+  var btnAgainEl = document.getElementById("btn-again");
+
+  var PAD = 12, GAP = 12, TILE = 105;
+  var MOVE_MS = 120, POP_MS = 200;
+
+  var grid = makeGrid();
+  var score = 0;
+  var best = 0;
+  var tileEls = {};   // "r,c" -> 元素
+  var tileSeq = 0;
+  var busy = false;
+  var won = false;
+  var overlayAction = null;
+
+  try {
+    best = parseInt(localStorage.getItem("best2048") || "0", 10) || 0;
+  } catch (e) { best = 0; }
+
+  // 生成 16 个背景格子
+  for (var i = 0; i < SIZE * SIZE; i++) {
+    var cell = document.createElement("div");
+    cell.className = "grid-cell";
+    gridCellsEl.appendChild(cell);
+  }
+
+  function key(r, c) { return r + "," + c; }
+
+  function xy(c, r) {
+    return { x: PAD + c * (TILE + GAP), y: PAD + r * (TILE + GAP) };
+  }
+
+  function tileClass(v) {
+    if (v >= 4096) return "tile tile-super";
+    if (v > 2048) return "tile tile-super";
+    return "tile tile-" + v;
+  }
+
+  function makeTileEl(r, c, v) {
+    var el = document.createElement("div");
+    el.className = tileClass(v);
+    el.textContent = v;
+    el.dataset.r = r;
+    el.dataset.c = c;
+    el.dataset.id = tileSeq++;
+    var p = xy(c, r);
+    el.style.transform = "translate(" + p.x + "px, " + p.y + "px)";
+    tileLayerEl.appendChild(el);
+    return el;
+  }
+
+  function updateScore() {
+    scoreEl.textContent = score;
+    bestEl.textContent = Math.max(best, score);
+  }
+
+  function renderInitial() {
+    tileLayerEl.innerHTML = "";
+    tileEls = {};
+    for (var r = 0; r < SIZE; r++) {
+      for (var c = 0; c < SIZE; c++) {
+        if (grid[r][c] !== 0) {
+          var el = makeTileEl(r, c, grid[r][c]);
+          tileEls[key(r, c)] = el;
+        }
+      }
+    }
+    updateScore();
+  }
+
+  function hideOverlay() { overlayEl.classList.add("hidden"); overlayAction = null; }
+
+  function showOverlay(text, btnText, action) {
+    overlayTextEl.textContent = text;
+    btnAgainEl.textContent = btnText;
+    overlayAction = action || null;
+    overlayEl.classList.remove("hidden");
+  }
+
+  function startNewGame() {
+    grid = makeGrid();
+    score = 0;
+    won = false;
+    busy = false;
+    hideOverlay();
+    addRandomTile(grid);
+    addRandomTile(grid);
+    renderInitial();
+  }
+
+  function handleMove(direction) {
+    if (busy) return;
+    var res = move(grid, direction);
+    if (!res.moved) return;
+    grid = res.grid;
+    score += res.gained;
+    busy = true;
+
+    // 1) 把现有 tile 元素移动到新位置，并按目标位置分桶（合并对会落在同一桶）
+    var buckets = {};
+    for (var i = 0; i < res.moves.length; i++) {
+      var mv = res.moves[i];
+      var fromKey = key(mv.from.r, mv.from.c);
+      var el = tileEls[fromKey];
+      if (!el) continue;
+      var p = xy(mv.to.c, mv.to.r);
+      el.style.transform = "translate(" + p.x + "px, " + p.y + "px)";
+      el.dataset.r = mv.to.r;
+      el.dataset.c = mv.to.c;
+      var toKey = key(mv.to.r, mv.to.c);
+      if (!buckets[toKey]) buckets[toKey] = [];
+      buckets[toKey].push({ el: el, merged: mv.merged, value: mv.value });
+      delete tileEls[fromKey];
+    }
+
+    // 2) 滑动动画结束后：合并、生成新方块、检查胜负
+    setTimeout(function () {
+      for (var k in buckets) {
+        var items = buckets[k];
+        var keep = items[items.length - 1];
+        if (items.length > 1 || keep.merged) {
+          keep.el.className = tileClass(keep.value);
+          keep.el.textContent = keep.value;
+          keep.el.classList.add("pop");
+          (function (el) {
+            setTimeout(function () { el.classList.remove("pop"); }, POP_MS);
+          })(keep.el);
+        }
+        for (var j = 0; j < items.length; j++) {
+          if (items[j] !== keep) items[j].el.remove();
+        }
+        tileEls[k] = keep.el;
+      }
+
+      var nt = addRandomTile(grid);
+      if (nt) {
+        var nel = makeTileEl(nt.r, nt.c, nt.value);
+        nel.classList.add("pop");
+        (function (el) {
+          setTimeout(function () { el.classList.remove("pop"); }, POP_MS);
+        })(nel);
+        tileEls[key(nt.r, nt.c)] = nel;
+      }
+
+      updateScore();
+
+      if (!won && maxTile(grid) >= WIN_TILE) {
+        won = true;
+        showOverlay("你赢了！🎉", "继续挑战", function () { hideOverlay(); });
+      } else if (!canMove(grid)) {
+        showOverlay("游戏结束 💀", "再来一局", startNewGame);
+      }
+      busy = false;
+    }, MOVE_MS);
+  }
+
+  // 键盘
+  document.addEventListener("keydown", function (e) {
+    var map = {
+      ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down",
+      a: "left", d: "right", w: "up", s: "down",
+      A: "left", D: "right", W: "up", S: "down"
+    };
+    var dir = map[e.key];
+    if (dir) {
+      e.preventDefault();
+      handleMove(dir);
+    }
+  });
+
+  // 触摸滑动
+  var touchStart = null;
+  boardEl.addEventListener("touchstart", function (e) {
+    touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+  }, { passive: true });
+  boardEl.addEventListener("touchend", function (e) {
+    if (!touchStart) return;
+    var dx = e.changedTouches[0].clientX - touchStart.x;
+    var dy = e.changedTouches[0].clientY - touchStart.y;
+    touchStart = null;
+    var ax = Math.abs(dx), ay = Math.abs(dy);
+    if (Math.max(ax, ay) < 24) return;
+    if (ax > ay) handleMove(dx > 0 ? "right" : "left");
+    else handleMove(dy > 0 ? "down" : "up");
+  }, { passive: true });
+
+  btnNewEl.addEventListener("click", startNewGame);
+  btnAgainEl.addEventListener("click", function () {
+    if (overlayAction) overlayAction();
+    else startNewGame();
+  });
+
+  startNewGame();
+}
+
+// ============================================================
+// node 环境导出（供单元测试）
+// ============================================================
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    SIZE: SIZE,
+    WIN_TILE: WIN_TILE,
+    makeGrid: makeGrid,
+    emptyCells: emptyCells,
+    addRandomTile: addRandomTile,
+    posAt: posAt,
+    collectLine: collectLine,
+    move: move,
+    canMove: canMove,
+    maxTile: maxTile
+  };
+}
+</script>
+</body>
+</html>

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from nju_agent.tools import list_files, read_file, revert_write_file, run_command, write_file
+from nju_agent.tools import list_files, read_file, revert_write_file, run_command, search_files, write_file
 
 
 def _init_git_repo(tmp_path: Path) -> None:
@@ -27,6 +27,18 @@ def test_list_files_keeps_non_blacklisted_dotfiles(tmp_path: Path) -> None:
     (tmp_path / ".env").write_text("secret", encoding="utf-8")
 
     assert list_files(str(tmp_path)) == [".env", "visible.txt"]
+
+
+def test_search_files_returns_matching_path_and_content(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("def play_game():\n    return '2048'\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("This project is about 2048.", encoding="utf-8")
+
+    results = search_files(str(tmp_path), "2048", limit=10)
+
+    assert results[0]["relative_path"] == "README.md"
+    assert any(item["relative_path"] == "src/main.py" for item in results)
+    assert any(item["match_kind"] == "content" for item in results)
 
 
 def test_read_and_write_file(tmp_path: Path) -> None:

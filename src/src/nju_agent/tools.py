@@ -1,7 +1,9 @@
 import difflib
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import subprocess
+from typing import Iterable
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,101 @@ def list_files(root: str) -> list[str]:
         for path in base.iterdir()
         if path.name not in {".git", ".nju_agent"}
     )
+
+
+_SEARCH_IGNORED_DIRS = {
+    ".git",
+    ".nju_agent",
+    ".pytest_cache",
+    ".mypy_cache",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "env",
+    "node_modules",
+    "dist",
+    "build",
+}
+
+
+def _iter_searchable_files(root: Path) -> Iterable[Path]:
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            name for name in dirnames if name not in _SEARCH_IGNORED_DIRS
+        )
+        for filename in sorted(filenames):
+            path = Path(dirpath) / filename
+            if path.name in _SEARCH_IGNORED_DIRS:
+                continue
+            yield path
+
+
+def _search_preview(line: str, terms: list[str]) -> str:
+    text = line.rstrip("\n")
+    if len(text) <= 240:
+        return text
+
+    lower_text = text.casefold()
+    match_index = -1
+    for term in terms:
+        position = lower_text.find(term)
+        if position != -1 and (match_index == -1 or position < match_index):
+            match_index = position
+
+    if match_index == -1:
+        return text[:237] + "..."
+
+    start = max(0, match_index - 60)
+    end = min(len(text), match_index + 140)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(text) else ""
+    return f"{prefix}{text[start:end]}{suffix}"
+
+
+def search_files(root: str, query: str, limit: int = 20) -> list[dict[str, object]]:
+    base = Path(root).resolve()
+    terms = [part.casefold() for part in query.split() if part.strip()]
+    if not terms or limit <= 0:
+        return []
+
+    results: list[dict[str, object]] = []
+    for path in _iter_searchable_files(base):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+
+        relative_path = path.relative_to(base).as_posix()
+        path_lower = relative_path.casefold()
+        if all(term in path_lower for term in terms):
+            results.append(
+                {
+                    "relative_path": relative_path,
+                    "line_number": 0,
+                    "line_text": "",
+                    "match_kind": "path",
+                }
+            )
+            if len(results) >= limit:
+                return results
+            continue
+
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            line_lower = line.casefold()
+            if all(term in line_lower for term in terms):
+                results.append(
+                    {
+                        "relative_path": relative_path,
+                        "line_number": line_number,
+                        "line_text": _search_preview(line, terms),
+                        "match_kind": "content",
+                    }
+                )
+                if len(results) >= limit:
+                    return results
+                break
+
+    return results
 
 
 def read_file(root: str, relative_path: str) -> str:

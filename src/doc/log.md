@@ -216,3 +216,32 @@ PYTHONPATH=src/src pytest src/tests -q
 ```text
 25 passed
 ```
+
+## 2026-09-01
+
+### 搜索工具优化
+
+目标：
+
+- 减少小任务中无关文件读取和过多输出。
+- 让 agent 先通过关键词定位相关文件，再读取少量命中文件。
+
+已完成：
+
+- 新增 `search_files` 本地搜索工具。
+- 在 tool calling 工具列表中新增 `search`。
+- 只读模式下开放 `search` / `list_files` / `read_file`。
+- 更新 system prompt，提示小任务优先搜索定位再精读。
+- 补充搜索工具和工具注册相关测试。
+
+验证命令：
+
+```bash
+PYTHONPATH=src/src pytest src/tests -q
+```
+
+验证结果：
+
+```text
+43 passed
+```

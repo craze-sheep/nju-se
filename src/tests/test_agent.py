@@ -660,10 +660,25 @@ def test_run_agent_read_only_blocks_write_tool(tmp_path: Path) -> None:
     )
 
     assert result == "done"
-    assert {tool["name"] for tool in tool_definitions(ACCESS_READ_ONLY)} == {"list_files", "read_file"}
+    assert {tool["name"] for tool in tool_definitions(ACCESS_READ_ONLY)} == {"search", "list_files", "read_file"}
     assert "write_file" not in {tool["name"] for tool in calls[0]["tools"]}
     assert calls[1]["input"][-1]["type"] == "function_call_output"
     assert not (tmp_path / "blocked.txt").exists()
+
+
+def test_call_tool_search_returns_matches(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("print('2048')\n", encoding="utf-8")
+
+    result = agent_module._call_tool(
+        "search",
+        {"query": "2048", "limit": 5},
+        tmp_path,
+        ACCESS_READ_ONLY,
+    )
+
+    assert "src/main.py" in result
+    assert "2048" in result
 
 
 def test_call_tool_cancels_dangerous_command(tmp_path: Path) -> None:

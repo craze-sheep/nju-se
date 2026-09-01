@@ -17,13 +17,14 @@ import tiktoken
 
 from .config import Settings, load_settings
 from .llm import build_client, request_response
-from .tools import list_files, read_file, run_command, revert_write_file, write_file
+from .tools import list_files, read_file, run_command, revert_write_file, search_files, write_file
 from .ui import TerminalUI, create_terminal_ui
 
 
 SYSTEM_PROMPT = """You are a coding agent.
 Use the available tools to complete the user's task.
 Keep file operations inside the workspace root.
+For small tasks, search first to locate relevant files, then read only a few focused files.
 When you finish, answer briefly in Chinese."""
 
 PLANNER_PROMPT = """你是一个 coding agent 的 planner。
@@ -152,6 +153,27 @@ def _command_head(user_text: str) -> str:
 
 def tool_definitions(access_mode: str = ACCESS_READ_ONLY) -> list[dict[str, Any]]:
     tools = [
+        {
+            "type": "function",
+            "name": "search",
+            "description": "在工作区内按关键词搜索文件内容和路径，返回命中的文件、行号和片段。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "要搜索的关键词或短语。",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "最多返回多少条结果，默认 20。",
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        },
         {
             "type": "function",
             "name": "list_files",
@@ -1455,6 +1477,13 @@ def _call_tool(
     root = str(workspace_root)
 
     try:
+        if name == "search":
+            query = str(arguments["query"])
+            limit = int(arguments.get("limit", 20))
+            return _format_tool_result(
+                name,
+                search_files(root, query, limit=limit),
+            )
         if name == "list_files":
             return json.dumps(list_files(root), ensure_ascii=False)
         if name == "read_file":
