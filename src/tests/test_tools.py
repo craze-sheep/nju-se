@@ -41,6 +41,18 @@ def test_search_files_returns_matching_path_and_content(tmp_path: Path) -> None:
     assert any(item["match_kind"] == "content" for item in results)
 
 
+def test_search_files_keeps_content_hits_when_path_hits_are_many(tmp_path: Path) -> None:
+    (tmp_path / "a_test.txt").write_text("alpha", encoding="utf-8")
+    (tmp_path / "b_test.txt").write_text("beta", encoding="utf-8")
+    (tmp_path / "zzz_notes.md").write_text("contains the test word", encoding="utf-8")
+
+    results = search_files(str(tmp_path), "test", limit=1)
+
+    assert len(results) == 1
+    assert results[0]["relative_path"] == "zzz_notes.md"
+    assert any(item["match_kind"] == "content" for item in results)
+
+
 def test_read_and_write_file(tmp_path: Path) -> None:
     _init_git_repo(tmp_path)
     result = write_file(str(tmp_path), "notes/hello.txt", "hello nju")
@@ -104,6 +116,21 @@ def test_write_file_uses_git_diff_and_restore_for_tracked_files(tmp_path: Path) 
     assert "diff --git" in result.diff
     revert_write_file(str(tmp_path), asdict(result))
     assert (tmp_path / "tracked.txt").read_text(encoding="utf-8") == "old"
+
+
+def test_revert_write_file_restores_dirty_tracked_snapshot(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("committed", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    tracked.write_text("uncommitted edit", encoding="utf-8")
+
+    result = write_file(str(tmp_path), "tracked.txt", "new")
+
+    revert_write_file(str(tmp_path), asdict(result))
+    assert tracked.read_text(encoding="utf-8") == "uncommitted edit"
 
 
 def test_write_file_uses_git_clean_for_new_files(tmp_path: Path) -> None:

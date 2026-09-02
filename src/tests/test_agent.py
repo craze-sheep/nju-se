@@ -1,6 +1,7 @@
 import json
 import builtins
 import subprocess
+import sys
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -290,10 +291,9 @@ def test_main_uses_settings_and_chat_session(monkeypatch) -> None:
     def fake_load_settings():
         return Settings(api_key="key", model="deepseek-test", max_steps=1)
 
-    def fake_run_chat_session(*, workspace_root, settings, client=None, logger=None, input_fn=None, background_finalize=False):
+    def fake_run_chat_session(*, workspace_root, settings, client=None, logger=None, input_fn=None):
         captured["workspace_root"] = workspace_root
         captured["settings"] = settings
-        captured["background_finalize"] = background_finalize
         return None
 
     monkeypatch.setattr(main_module, "load_settings", fake_load_settings)
@@ -301,7 +301,6 @@ def test_main_uses_settings_and_chat_session(monkeypatch) -> None:
 
     assert main_module.main([]) == 0
     assert captured["workspace_root"] == Path.cwd()
-    assert captured["background_finalize"] is True
 
 
 def test_run_chat_session_keeps_conversation_history(tmp_path: Path) -> None:
@@ -728,11 +727,140 @@ def test_call_tool_cancels_dangerous_command(tmp_path: Path) -> None:
     assert any("Y/N" in prompt for prompt in prompts)
 
 
+def test_call_tool_normalizes_stringified_command_array(tmp_path: Path) -> None:
+    result = agent_module._call_tool(
+        "run_command",
+        {"command": json.dumps([sys.executable, "-c", "print('ok')"])},
+        tmp_path,
+        ACCESS_WRITE,
+    )
+
+    payload = json.loads(result)
+    assert payload["exit_code"] == 0
+    assert payload["stdout"].strip() == "ok"
+
+
+def test_run_agent_handles_missing_tool_arguments_without_crashing(tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return SimpleNamespace(
+                    id="resp-1",
+                    output=[
+                        SimpleNamespace(
+                            type="function_call",
+                            name="run_command",
+                            arguments=None,
+                            call_id="call-1",
+                        )
+                    ],
+                    output_text="",
+                )
+            return SimpleNamespace(id="resp-2", output=[], output_text="done")
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = FakeResponses()
+
+    result = run_agent(
+        "bad arguments",
+        workspace_root=tmp_path,
+        client=FakeClient(),
+        settings=Settings(api_key="key", model="deepseek-test", max_steps=3),
+        access_mode=ACCESS_WRITE,
+        logger=lambda _: None,
+    )
+
+    assert result == "done"
+    assert calls[1]["input"][-1]["type"] == "function_call_output"
+    assert str(calls[1]["input"][-1]["output"]).startswith("错误：工具参数不是有效 JSON")
+
+
+def test_run_agent_emits_tool_logs_without_ui(tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return SimpleNamespace(
+                    id="resp-1",
+                    output=[
+                        SimpleNamespace(
+                            type="function_call",
+                            name="read_file",
+                            arguments=json.dumps({"relative_path": "hello.txt"}),
+                            call_id="call-1",
+                        )
+                    ],
+                    output_text="",
+                )
+            return SimpleNamespace(id="resp-2", output=[], output_text="done")
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = FakeResponses()
+
+    (tmp_path / "hello.txt").write_text("hello nju", encoding="utf-8")
+    logs: list[str] = []
+    result = run_agent(
+        "read file",
+        workspace_root=tmp_path,
+        client=FakeClient(),
+        settings=Settings(api_key="key", model="deepseek-test", max_steps=3),
+        logger=logs.append,
+    )
+
+    assert result == "done"
+    assert any(line.startswith("工具调用：read_file") for line in logs)
+    assert any(line.startswith("工具结果：hello nju") for line in logs)
+
+
+def test_run_agent_returns_error_text_when_max_steps_is_exceeded(tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                id="resp-1",
+                output=[
+                    SimpleNamespace(
+                        type="function_call",
+                        name="read_file",
+                        arguments=json.dumps({"relative_path": "missing.txt"}),
+                        call_id="call-1",
+                    )
+                ],
+                output_text="",
+            )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = FakeResponses()
+
+    logs: list[str] = []
+    result = run_agent(
+        "keep looping",
+        workspace_root=tmp_path,
+        client=FakeClient(),
+        settings=Settings(api_key="key", model="deepseek-test", max_steps=1),
+        logger=logs.append,
+    )
+
+    assert result == "错误：Exceeded max agent steps"
+    assert any(line == "最终结果：错误：Exceeded max agent steps" for line in logs)
+
+
 def test_dangerous_command_reason_only_checks_command_name() -> None:
     assert agent_module._dangerous_command_reason(["echo", "rm"]) is None
     assert agent_module._dangerous_command_reason(["rmdir.py"]) is None
     assert agent_module._dangerous_command_reason(["git", "status"]) is None
     assert agent_module._dangerous_command_reason(["git", "clean", "-fd"]) == "git"
+    assert agent_module._dangerous_command_reason(["git", "checkout", "README.md"]) is None
 
 
 def test_run_agent_confirms_dangerous_command(tmp_path: Path) -> None:
@@ -1003,6 +1131,36 @@ def test_run_chat_session_default_terminal_ui_emits_final_result(monkeypatch, tm
     assert any(message.startswith("最终结果：") for message in fake_ui.outputs)
     assert any(message == "最终结果：done" for message in fake_ui.outputs)
     assert any(message.startswith("state:") for message in fake_ui.outputs)
+
+
+def test_run_chat_session_handles_finalize_errors_without_crashing(tmp_path: Path) -> None:
+    class FailingFinalizeResponses:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _empty_response("done")
+            raise RuntimeError("LLM down")
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = FailingFinalizeResponses()
+
+    inputs = iter(["hello", "/exit"])
+    logs: list[str] = []
+
+    run_chat_session(
+        workspace_root=tmp_path,
+        client=FakeClient(),
+        settings=Settings(api_key="key", model="deepseek-test", max_steps=3),
+        logger=logs.append,
+        input_fn=lambda _: next(inputs),
+    )
+
+    assert any(line == "最终结果：done" for line in logs)
+    assert any(line.startswith("会话收尾失败：LLM down") for line in logs)
 
 
 def test_fit_visible_conversation_truncates_overlong_single_turn() -> None:

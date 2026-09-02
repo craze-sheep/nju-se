@@ -117,7 +117,8 @@ def search_files(root: str, query: str, limit: int = 20) -> list[dict[str, objec
     if not terms or limit <= 0:
         return []
 
-    results: list[dict[str, object]] = []
+    content_results: list[dict[str, object]] = []
+    path_results: list[dict[str, object]] = []
     for path in _iter_searchable_files(base):
         try:
             text = path.read_text(encoding="utf-8")
@@ -126,23 +127,10 @@ def search_files(root: str, query: str, limit: int = 20) -> list[dict[str, objec
 
         relative_path = path.relative_to(base).as_posix()
         path_lower = relative_path.casefold()
-        if all(term in path_lower for term in terms):
-            results.append(
-                {
-                    "relative_path": relative_path,
-                    "line_number": 0,
-                    "line_text": "",
-                    "match_kind": "path",
-                }
-            )
-            if len(results) >= limit:
-                return results
-            continue
-
         for line_number, line in enumerate(text.splitlines(), start=1):
             line_lower = line.casefold()
             if all(term in line_lower for term in terms):
-                results.append(
+                content_results.append(
                     {
                         "relative_path": relative_path,
                         "line_number": line_number,
@@ -150,10 +138,25 @@ def search_files(root: str, query: str, limit: int = 20) -> list[dict[str, objec
                         "match_kind": "content",
                     }
                 )
-                if len(results) >= limit:
-                    return results
                 break
 
+        else:
+            if all(term in path_lower for term in terms):
+                path_results.append(
+                    {
+                        "relative_path": relative_path,
+                        "line_number": 0,
+                        "line_text": "",
+                        "match_kind": "path",
+                    }
+                )
+
+    results = content_results[:limit]
+    if len(results) >= limit:
+        return results
+
+    remaining = limit - len(results)
+    results.extend(path_results[:remaining])
     return results
 
 
@@ -282,6 +285,11 @@ def revert_write_file(root: str, change: dict[str, object]) -> None:
     before_content = change.get("before_content", None)
     git_root = _git_repo_root(root)
     if tracked_before:
+        if before_content is not None:
+            target = _safe_path(root, relative_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(str(before_content), encoding="utf-8")
+            return
         if not git_root:
             raise RuntimeError("Git repository not found")
         result = _run_git(

@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
-import os
-import subprocess
-import sys
+import shlex
 import time
 from datetime import datetime
 from functools import lru_cache
@@ -283,14 +281,6 @@ def _global_memory_file(workspace_root: Path) -> Path:
     return workspace_root / ".nju_agent" / "global_memory.md"
 
 
-def _finalizer_snapshot_dir(workspace_root: Path) -> Path:
-    return workspace_root / ".nju_agent" / "finalizer_snapshots"
-
-
-def _finalizer_snapshot_file(workspace_root: Path, session_id: str) -> Path:
-    return _finalizer_snapshot_dir(workspace_root) / f"{session_id}.json"
-
-
 def _write_batches_dir(workspace_root: Path) -> Path:
     return workspace_root / ".nju_agent" / "write_batches"
 
@@ -361,82 +351,6 @@ def _load_json_file(path: Path, default: Any) -> Any:
 def _save_json_file(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _save_finalizer_snapshot(
-    workspace_root: Path,
-    session_snapshot: dict[str, Any],
-    conversation_snapshot: list[dict[str, Any]],
-    keep_empty: bool,
-) -> Path:
-    snapshot = {
-        "workspace_root": str(workspace_root),
-        "session_snapshot": session_snapshot,
-        "conversation_snapshot": conversation_snapshot,
-        "keep_empty": keep_empty,
-    }
-    path = _finalizer_snapshot_file(workspace_root, str(session_snapshot["id"]))
-    _save_json_file(path, snapshot)
-    return path
-
-
-def _load_finalizer_snapshot(path: Path) -> dict[str, Any]:
-    raw = _load_text_file(path)
-    if not raw:
-        raise RuntimeError("finalizer snapshot is empty")
-    data = json.loads(raw)
-    if not isinstance(data, dict):
-        raise RuntimeError("finalizer snapshot must be a JSON object")
-    return data
-
-
-def _finalize_snapshot_file(snapshot_path: Path) -> None:
-    data = _load_finalizer_snapshot(snapshot_path)
-    workspace_root = Path(str(data.get("workspace_root", ""))).resolve()
-    session_snapshot = data.get("session_snapshot", {})
-    conversation_snapshot = data.get("conversation_snapshot", [])
-    keep_empty = bool(data.get("keep_empty", False))
-
-    if not isinstance(session_snapshot, dict):
-        raise RuntimeError("finalizer snapshot session data is invalid")
-    if not isinstance(conversation_snapshot, list):
-        raise RuntimeError("finalizer snapshot conversation data is invalid")
-
-    session_id = str(session_snapshot.get("id", "")).strip()
-    if not session_id:
-        raise RuntimeError("finalizer snapshot session id is missing")
-
-    settings = load_settings()
-    client = build_client(settings)
-    _sync_session_state(
-        sessions_index_path=_sessions_index_file(workspace_root),
-        sessions=_load_sessions_index(_sessions_index_file(workspace_root)),
-        active_session=session_snapshot,
-        active_session_path=_session_path(workspace_root, session_id),
-        conversation=conversation_snapshot,
-        keep_empty=keep_empty,
-    )
-    _finalize_session_memory(
-        workspace_root=workspace_root,
-        session_id=session_id,
-        conversation=conversation_snapshot,
-        client=client,
-        settings=settings,
-    )
-
-
-def _spawn_detached_finalizer(snapshot_path: Path) -> subprocess.Popen[Any]:
-    data = _load_finalizer_snapshot(snapshot_path)
-    workspace_root = Path(str(data.get("workspace_root", ""))).resolve()
-    return subprocess.Popen(
-        [sys.executable, "-m", "nju_agent", "--finalize-snapshot", str(snapshot_path)],
-        cwd=str(workspace_root),
-        env=os.environ.copy(),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
 
 
 def _load_write_batches(workspace_root: Path, session_id: str) -> list[dict[str, Any]]:
@@ -1290,7 +1204,7 @@ def _dangerous_command_reason(command: list[str]) -> str | None:
         return command_name
     if command_name.startswith("mkfs"):
         return "mkfs"
-    if command_name == "git" and len(command) > 1 and command[1] in {"clean", "reset", "restore", "checkout"}:
+    if command_name == "git" and len(command) > 1 and command[1] in {"clean", "reset", "restore"}:
         return "git"
     return None
 
@@ -1421,6 +1335,51 @@ def _response_item_to_history(item: Any) -> dict[str, Any] | None:
     return None
 
 
+def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict[str, Any] | None, str | None]:
+    if isinstance(raw_arguments, dict):
+        return raw_arguments, None
+    if not isinstance(raw_arguments, str):
+        return None, "错误：工具参数不是有效 JSON：参数必须是字符串"
+
+    try:
+        parsed = json.loads(raw_arguments)
+    except json.JSONDecodeError as exc:
+        return None, f"错误：工具参数不是有效 JSON：{exc}"
+
+    if not isinstance(parsed, dict):
+        return None, "错误：工具参数必须是 JSON 对象"
+
+    return parsed, None
+
+
+def _normalize_command_value(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return _normalize_string_list(value)
+    if not isinstance(value, str):
+        return []
+
+    text = value.strip()
+    if not text:
+        return []
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    else:
+        if isinstance(parsed, list):
+            return _normalize_string_list(parsed)
+        if isinstance(parsed, str):
+            text = parsed.strip()
+            if not text:
+                return []
+
+    try:
+        return _normalize_string_list(shlex.split(text))
+    except ValueError:
+        return []
+
+
 def _call_tool(
     name: str,
     arguments: dict[str, Any],
@@ -1468,8 +1427,8 @@ def _call_tool(
         if name == "run_command":
             if not _can_use_write_tools(access_mode):
                 return "错误：当前会话是只读权限，不能使用 run_command"
-            command = arguments["command"]
-            if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+            command = _normalize_command_value(arguments["command"])
+            if not command:
                 return "错误：run_command 的 command 参数必须是字符串数组"
             reason = _dangerous_command_reason(command)
             if reason is not None:
@@ -1526,6 +1485,7 @@ def _run_conversation(
     workspace_root = workspace_root.resolve()
     session_memory = session_memory or _default_session_memory()
     emit = logger or (lambda _: None)
+    tool_emit = ui.emit if ui is not None else emit
 
     response = None
 
@@ -1573,10 +1533,12 @@ def _run_conversation(
             return final_text
 
         for item in tool_calls:
-            try:
-                arguments = json.loads(getattr(item, "arguments", "{}"))
-            except json.JSONDecodeError as exc:
-                result = f"错误：工具参数不是有效 JSON：{exc}"
+            raw_arguments = getattr(item, "arguments", "{}")
+            tool_emit(f"工具调用：{item.name} {raw_arguments}")
+            arguments, parse_error = _parse_tool_arguments(raw_arguments)
+            if parse_error is not None:
+                result = parse_error
+                tool_emit(f"工具结果：{result}")
                 conversation.append(
                     {
                         "type": "function_call_output",
@@ -1586,8 +1548,6 @@ def _run_conversation(
                 )
                 continue
 
-            if ui is not None:
-                ui.emit(f"工具调用：{item.name} {getattr(item, 'arguments', '')}")
             tool_context = (
                 ui.status(f"正在执行工具：{item.name}") if ui is not None else nullcontext()
             )
@@ -1601,8 +1561,7 @@ def _run_conversation(
                     confirm_input_fn=confirm_input_fn,
                     ui=ui,
                 )
-            if ui is not None:
-                ui.emit(f"工具结果：{result}")
+            tool_emit(f"工具结果：{result}")
             conversation.append(
                 {
                     "type": "function_call_output",
@@ -1743,19 +1702,27 @@ def run_agent(
     client = client or build_client(settings)
     conversation: list[dict[str, Any]] = [{"role": "user", "content": task}]
     write_changes: list[dict[str, Any]] = []
-    return _run_task_with_optional_subagents(
-        task=task,
-        conversation=conversation,
-        workspace_root=workspace_root,
-        client=client,
-        settings=settings,
-        session_memory=_default_session_memory(),
-        access_mode=access_mode,
-        subagents_enabled=subagents_enabled,
-        write_changes=write_changes,
-        logger=logger,
-        confirm_input_fn=confirm_input_fn,
-    )
+    try:
+        return _run_task_with_optional_subagents(
+            task=task,
+            conversation=conversation,
+            workspace_root=workspace_root,
+            client=client,
+            settings=settings,
+            session_memory=_default_session_memory(),
+            access_mode=access_mode,
+            subagents_enabled=subagents_enabled,
+            write_changes=write_changes,
+            logger=logger,
+            confirm_input_fn=confirm_input_fn,
+        )
+    except RuntimeError as exc:
+        if str(exc) != "Exceeded max agent steps":
+            raise
+        error_text = f"错误：{exc}"
+        emit = logger or (lambda _: None)
+        emit(f"最终结果：{error_text}")
+        return error_text
 
 
 def run_chat_session(
@@ -1765,7 +1732,6 @@ def run_chat_session(
     settings: Settings | None = None,
     logger: Callable[[str], None] | None = None,
     input_fn: Callable[[str], str] = input,
-    background_finalize: bool = False,
     subagents_enabled: bool = False,
 ) -> None:
     settings = settings or load_settings()
@@ -1782,7 +1748,6 @@ def run_chat_session(
     sessions_index_path = _sessions_index_file(workspace_root)
     sessions = _load_sessions_index(sessions_index_path)
     legacy_conversation_path = _conversation_file(workspace_root)
-    exit_requested = False
 
     if not sessions and legacy_conversation_path.exists():
         conversation = _load_conversation(legacy_conversation_path)
@@ -1800,7 +1765,6 @@ def run_chat_session(
     conversation: list[dict[str, Any]] = []
     session_memory = _default_session_memory()
     active_session_persisted = False
-    pending_finalizers: dict[str, Any] = {}
     if terminal_ui is not None:
         terminal_ui.banner(
             workspace_root=workspace_root,
@@ -1811,60 +1775,24 @@ def run_chat_session(
             subagents_enabled=_session_subagents_enabled(active_session),
         )
 
-    def _wait_for_finalizer(session_id: str) -> None:
-        thread = pending_finalizers.get(session_id)
-        if thread is None:
-            return
-        wait = getattr(thread, "wait", None)
-        if callable(wait):
-            wait()
-        else:
-            thread.join()
-        pending_finalizers.pop(session_id, None)
-
-    def _wait_for_all_finalizers() -> None:
-        for session_id in list(pending_finalizers.keys()):
-            _wait_for_finalizer(session_id)
-
-    def _finalize_snapshot(
-        *,
-        session_snapshot: dict[str, Any],
-        conversation_snapshot: list[dict[str, Any]],
-        keep_empty: bool,
-    ) -> dict[str, Any]:
-        if not conversation_snapshot:
-            return _load_session_memory(workspace_root, str(session_snapshot["id"]))
-        session_path = _session_path(workspace_root, str(session_snapshot["id"]))
-        _sync_session_state(
-            sessions_index_path=sessions_index_path,
-            sessions=_load_sessions_index(sessions_index_path),
-            active_session=session_snapshot,
-            active_session_path=session_path,
-            conversation=conversation_snapshot,
-            keep_empty=keep_empty,
-        )
-        return _finalize_session_memory(
-            workspace_root=workspace_root,
-            session_id=str(session_snapshot["id"]),
-            conversation=conversation_snapshot,
-            client=client,
-            settings=settings,
-        )
-
     def finalize_current_session() -> None:
         nonlocal sessions, session_memory, active_session_persisted
         if not conversation:
             return
-        _wait_for_finalizer(str(active_session["id"]))
         finalize_context = (
             terminal_ui.status("正在整理会话记录") if terminal_ui is not None else nullcontext()
         )
         with finalize_context:
-            session_memory = _finalize_snapshot(
-                session_snapshot=active_session,
-                conversation_snapshot=conversation,
-                keep_empty=active_session_persisted,
-            )
+            try:
+                session_memory = _finalize_session_memory(
+                    workspace_root=workspace_root,
+                    session_id=str(active_session["id"]),
+                    conversation=conversation,
+                    client=client,
+                    settings=settings,
+                )
+            except Exception as exc:
+                emit(f"会话收尾失败：{exc}")
         sessions = _load_sessions_index(sessions_index_path)
         active_session_persisted = True
 
@@ -1899,24 +1827,7 @@ def run_chat_session(
             continue
         maybe_compact_session_memory()
         if user_text in {"/exit", "exit", "quit", "/quit"}:
-            if background_finalize and conversation:
-                _sync_session_state(
-                    sessions_index_path=sessions_index_path,
-                    sessions=sessions,
-                    active_session=active_session,
-                    active_session_path=active_session_path,
-                    conversation=conversation,
-                )
-                snapshot_path = _save_finalizer_snapshot(
-                    workspace_root,
-                    deepcopy(active_session),
-                    deepcopy(conversation),
-                    active_session_persisted,
-                )
-                _spawn_detached_finalizer(snapshot_path)
-                exit_requested = True
-            else:
-                finalize_current_session()
+            finalize_current_session()
             break
         if user_text in {"/diff", "diff"}:
             emit(_last_write_diff(workspace_root, str(active_session["id"])))
@@ -2011,24 +1922,7 @@ def run_chat_session(
             )
             selected_session_id = str(selected_session.get("id", ""))
             if conversation and selected_session_id != str(active_session.get("id", "")):
-                session_snapshot = deepcopy(active_session)
-                conversation_snapshot = deepcopy(conversation)
-                keep_empty_snapshot = active_session_persisted
-                session_id_snapshot = str(session_snapshot["id"])
-
-                thread = pending_finalizers.get(session_id_snapshot)
-                if thread is None:
-                    snapshot_path = _save_finalizer_snapshot(
-                        workspace_root,
-                        session_snapshot,
-                        conversation_snapshot,
-                        keep_empty_snapshot,
-                    )
-                    pending_finalizers[session_id_snapshot] = _spawn_detached_finalizer(
-                        snapshot_path
-                    )
-            if selected_session_id:
-                _wait_for_finalizer(selected_session_id)
+                finalize_current_session()
             active_session = selected_session
             active_session_path = _session_path(workspace_root, str(active_session["id"]))
             conversation = _load_conversation(active_session_path) if existing_session else []
@@ -2094,6 +1988,3 @@ def run_chat_session(
             conversation=conversation,
         )
         active_session_persisted = True
-
-    if not exit_requested:
-        _wait_for_all_finalizers()
